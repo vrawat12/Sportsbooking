@@ -1,0 +1,14 @@
+# Credentials — never commit this
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Playwright
+playwright-report/
+test-results/
