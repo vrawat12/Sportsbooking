@@ -189,6 +189,45 @@ def select_sport(page) -> bool:
     return False
 
 
+def _wait_for_calendar(page) -> None:
+    """
+    Block until the calendar grid has rendered at least one slot cell.
+    Looks for any element whose text is 'Reserve', 'NONE AVAILABLE', or
+    'UNAVAILABLE' — all of which are only present once the grid is painted.
+    Falls back to FullCalendar structural selectors.
+    """
+    # Try the most specific signal first: any visible slot label
+    try:
+        page.wait_for_selector(
+            "text=/^(Reserve|NONE AVAILABLE|UNAVAILABLE)$/i",
+            timeout=15_000,
+        )
+        return
+    except PlaywrightTimeout:
+        pass
+
+    # Fallback: wait for a FullCalendar grid cell to exist in the DOM
+    for sel in (".fc-widget-content", ".fc-time-grid td", ".fc-day-grid td",
+                "[class*='fc-slot']", "td.fc-agenda-slots"):
+        try:
+            page.wait_for_selector(sel, timeout=8_000)
+            return
+        except PlaywrightTimeout:
+            continue
+
+    log.debug("_wait_for_calendar: calendar may not have fully rendered")
+
+
+# Selectors for FullCalendar's "go to next day/week" button
+_NEXT_BTN_SELECTORS = [
+    ".fc-next-button",
+    "button.fc-button[title*='next' i]",
+    "button[aria-label*='next' i]",
+    ".fc-button-next",
+    "a.fc-next",
+]
+
+
 def find_and_book_slot(page) -> bool:
     """
     Scan the calendar/grid for available slots within preferred windows
@@ -200,10 +239,10 @@ def find_and_book_slot(page) -> bool:
         target_date = today + timedelta(days=day_offset)
         log.info("Checking availability for %s…", target_date.strftime("%A %Y-%m-%d"))
 
-        # Navigate to the target date if the page supports date navigation
-        _navigate_to_date(page, target_date)
+        # Navigate the calendar to this date, then wait for it to render.
+        # Pass day_offset so the function knows whether to click the next arrow.
+        _navigate_to_date(page, day_offset)
 
-        # Find all available (not disabled/booked) time slots
         booked = _attempt_book_on_page(page, target_date)
         if booked:
             return True
@@ -211,35 +250,43 @@ def find_and_book_slot(page) -> bool:
     return False
 
 
-def _navigate_to_date(page, target_date) -> None:
+def _navigate_to_date(page, day_offset: int) -> None:
     """
-    Attempt to set the date picker to target_date.
-    CourtReserve uses a date input or clickable calendar.
-    """
-    date_str = target_date.strftime("%m/%d/%Y")
+    Advance the CourtReserve calendar to the correct date.
 
-    # Try common date input selectors
-    date_selectors = [
-        'input[id*="date" i][type="text"]',
-        'input[id*="date" i][type="date"]',
-        'input[name*="date" i]',
-        'input.datepicker',
-    ]
-    for sel in date_selectors:
+    CourtReserve uses FullCalendar with prev/next arrow buttons; there is no
+    free-form date input.  We start from today (day_offset == 0 — just wait
+    for the calendar to render) and click the next-day arrow once per
+    subsequent offset so we always advance exactly one day at a time through
+    the find_and_book_slot loop.
+    """
+    if day_offset == 0:
+        # First day: calendar is already on today; just wait for it to paint.
+        _wait_for_calendar(page)
+        return
+
+    # Click the "next" arrow once to move one day forward.
+    clicked = False
+    for sel in _NEXT_BTN_SELECTORS:
         try:
-            el = page.locator(sel).first
-            if el.count() > 0 and el.is_visible(timeout=1_500):
-                el.triple_click()
-                el.fill(date_str)
-                el.press("Enter")
-                page.wait_for_load_state("networkidle")
-                log.debug("Set date picker to %s", date_str)
-                return
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=3_000):
+                btn.click()
+                clicked = True
+                break
+        except PlaywrightTimeout:
+            continue
         except Exception:
-            pass
+            continue
 
-    # Fallback: try clicking 'next day' arrows until we reach the target
-    # (only useful when DAYS_AHEAD is small)
+    if not clicked:
+        log.warning(
+            "Could not find next-day arrow (offset %d); calendar may not advance.",
+            day_offset,
+        )
+
+    # Wait for the new day's slots to render before scanning.
+    _wait_for_calendar(page)
 
 
 def _attempt_book_on_page(page, target_date) -> bool:
