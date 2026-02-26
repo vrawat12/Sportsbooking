@@ -16,6 +16,7 @@ Usage:
 
 import os
 import time
+import random
 import logging
 from datetime import datetime, timedelta
 
@@ -38,6 +39,9 @@ DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "7"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
 SPORT_TYPE = os.getenv("SPORT_TYPE", "badminton").lower()
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
+# Path where Playwright storage state (cookies + localStorage) is persisted
+# between runs so we avoid a fresh login every 30-minute cycle.
+COOKIES_FILE = os.getenv("COOKIES_FILE", "courtreserve_cookies.json")
 
 # Parse preferred time windows: "6,12,17,22" → [(6,12),(17,22)]
 _raw_windows = os.getenv("PREFERRED_TIME_WINDOWS", "6,12,17,22").split(",")
@@ -83,6 +87,11 @@ def _slot_in_preferred_window(slot_hour: int) -> bool:
     return any(start <= slot_hour < end for start, end in PREFERRED_WINDOWS)
 
 
+def _human_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
+    """Sleep a random interval to mimic human interaction timing."""
+    time.sleep(random.uniform(min_s, max_s))
+
+
 # ---------------------------------------------------------------------------
 # Core automation
 # ---------------------------------------------------------------------------
@@ -113,17 +122,20 @@ def login(page) -> None:
 
     log.info("Clicking LOG IN button…")
     login_btn.click()
+    _human_delay()  # wait for modal to animate in
 
     # Login form appears (modal or new view) — wait for the email field
     email_input = page.locator('input[placeholder="Enter Your Email"]')
     email_input.wait_for(state="visible", timeout=15_000)
     email_input.fill(EMAIL)
     log.debug("Filled email field.")
+    _human_delay()  # pause between fields, like a human tabbing over
 
     password_input = page.locator('input[placeholder="Enter Your Password"]')
     password_input.wait_for(state="visible", timeout=10_000)
     password_input.fill(PASSWORD)
     log.debug("Filled password field.")
+    _human_delay()  # pause before submitting
 
     # Submit — target the primary "Continue" button explicitly to avoid
     # matching the "Continue with Google" social-login button
@@ -629,19 +641,49 @@ def _confirm_booking(page) -> bool:
 def run_once() -> bool:
     """Run a single check-and-book cycle.  Returns True if a slot was booked."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(
+        browser = pw.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--window-size=1280,900",
+                # Removes the CDP "Automation" flag that Cloudflare detects.
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+
+        ctx_kwargs = dict(
             viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="America/New_York",
         )
+        # Reuse saved cookies/localStorage from the previous run so we skip
+        # the login flow entirely on most cycles.
+        if os.path.exists(COOKIES_FILE):
+            ctx_kwargs["storage_state"] = COOKIES_FILE
+            log.info("Loaded saved session from %s", COOKIES_FILE)
+
+        context = browser.new_context(**ctx_kwargs)
+
+        # Mask navigator.webdriver — the primary JS property Cloudflare
+        # checks to distinguish headless browsers from real users.
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
         page = context.new_page()
 
         try:
             login(page)
+            # Always persist the session after login (or when already
+            # authenticated via saved cookies) so the next cycle is cookie-warm.
+            page.context.storage_state(path=COOKIES_FILE)
+            log.info("Saved session cookies to %s", COOKIES_FILE)
+
             navigate_to_bookings(page)
             select_sport(page)
             booked = find_and_book_slot(page)
