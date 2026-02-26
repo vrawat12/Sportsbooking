@@ -189,28 +189,71 @@ def select_sport(page) -> bool:
     return False
 
 
-def _wait_for_calendar(page) -> None:
+def _get_calendar_frame(page):
+    """
+    Detect which frame (iframe or main page) contains the booking calendar.
+
+    CourtReserve embeds the reservation grid inside an <iframe>.
+    This function:
+      - waits for any <iframe> tags to appear in the page
+      - logs the total number of iframes found (for debugging)
+      - probes each iframe for calendar content (Reserve / NONE AVAILABLE)
+      - returns the matching Frame, falling back to the main page if none found
+
+    Both Frame and Page expose identical .locator() / .wait_for_selector()
+    APIs so callers can treat the return value uniformly.
+    """
+    # Give the page a moment to create any iframes before enumerating
+    try:
+        page.wait_for_selector("iframe", timeout=10_000)
+    except PlaywrightTimeout:
+        pass  # No iframes visible yet — will still enumerate page.frames
+
+    all_frames = page.frames          # index 0 is always the main frame
+    iframe_count = len(all_frames) - 1
+    log.info("Found %d iframe(s) on the page.", iframe_count)
+    for idx, frm in enumerate(all_frames[1:], start=1):
+        log.debug("  iframe[%d] url=%s", idx, frm.url)
+
+    # Return the first iframe that contains calendar slot labels
+    for idx, frm in enumerate(all_frames[1:], start=1):
+        try:
+            frm.wait_for_selector(
+                "text=/Reserve|NONE AVAILABLE/i",
+                timeout=8_000,
+            )
+            log.info("Calendar grid detected in iframe[%d].", idx)
+            return frm
+        except PlaywrightTimeout:
+            continue
+
+    log.info("No calendar iframe matched; using main page frame.")
+    return page
+
+
+def _wait_for_calendar(ctx) -> None:
     """
     Block until the calendar grid has rendered at least one slot cell.
-    Looks for any element whose text is 'Reserve', 'NONE AVAILABLE', or
-    'UNAVAILABLE' — all of which are only present once the grid is painted.
-    Falls back to FullCalendar structural selectors.
+    ctx may be a Page or a Frame — both share the same selector API.
+
+    Looks for slot-label text ('Reserve' / 'NONE AVAILABLE') first, then
+    falls back to FullCalendar structural selectors.
     """
-    # Try the most specific signal first: any visible slot label
+    # Most specific signal: a rendered slot label
     try:
-        page.wait_for_selector(
-            "text=/^(Reserve|NONE AVAILABLE|UNAVAILABLE)$/i",
+        ctx.wait_for_selector(
+            "text=/Reserve|NONE AVAILABLE/i",
             timeout=15_000,
         )
         return
     except PlaywrightTimeout:
         pass
 
-    # Fallback: wait for a FullCalendar grid cell to exist in the DOM
+    # Structural fallback: any FullCalendar grid cell
     for sel in (".fc-widget-content", ".fc-time-grid td", ".fc-day-grid td",
                 "[class*='fc-slot']", "td.fc-agenda-slots"):
         try:
-            page.wait_for_selector(sel, timeout=8_000)
+            ctx.wait_for_selector(sel, timeout=8_000)
             return
         except PlaywrightTimeout:
             continue
@@ -235,49 +278,56 @@ def find_and_book_slot(page) -> bool:
     """
     today = datetime.today().date()
 
+    # Discover which frame holds the calendar (also logs iframe count).
+    # _get_calendar_frame waits for content to appear, so day_offset=0 needs
+    # no additional wait inside _navigate_to_date.
+    cal_frame = _get_calendar_frame(page)
+
     for day_offset in range(DAYS_AHEAD):
         target_date = today + timedelta(days=day_offset)
         log.info("Checking availability for %s…", target_date.strftime("%A %Y-%m-%d"))
 
-        # Navigate the calendar to this date, then wait for it to render.
-        # Pass day_offset so the function knows whether to click the next arrow.
-        _navigate_to_date(page, day_offset)
+        _navigate_to_date(page, cal_frame, day_offset)
 
-        booked = _attempt_book_on_page(page, target_date)
+        booked = _attempt_book_on_page(page, cal_frame, target_date)
         if booked:
             return True
 
     return False
 
 
-def _navigate_to_date(page, day_offset: int) -> None:
+def _navigate_to_date(page, cal_frame, day_offset: int) -> None:
     """
     Advance the CourtReserve calendar to the correct date.
 
-    CourtReserve uses FullCalendar with prev/next arrow buttons; there is no
-    free-form date input.  We start from today (day_offset == 0 — just wait
-    for the calendar to render) and click the next-day arrow once per
-    subsequent offset so we always advance exactly one day at a time through
-    the find_and_book_slot loop.
+    CourtReserve uses FullCalendar's next-arrow button (no free-form date
+    input).  We advance one day at a time through the loop: day_offset==0
+    means the calendar is already on today (no click needed); each subsequent
+    call clicks next once and waits for the new day to render.
+
+    The next-arrow may live inside the iframe or in the main page; we try
+    the calendar frame first and fall back to the main page.
     """
     if day_offset == 0:
-        # First day: calendar is already on today; just wait for it to paint.
-        _wait_for_calendar(page)
+        # _get_calendar_frame already confirmed the calendar is rendered.
         return
 
-    # Click the "next" arrow once to move one day forward.
+    # Try to click the next-day arrow — search iframe first, then main page.
     clicked = False
-    for sel in _NEXT_BTN_SELECTORS:
-        try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=3_000):
-                btn.click()
-                clicked = True
-                break
-        except PlaywrightTimeout:
-            continue
-        except Exception:
-            continue
+    for search_ctx in (cal_frame, page):
+        for sel in _NEXT_BTN_SELECTORS:
+            try:
+                btn = search_ctx.locator(sel).first
+                if btn.is_visible(timeout=2_000):
+                    btn.click()
+                    clicked = True
+                    break
+            except PlaywrightTimeout:
+                continue
+            except Exception:
+                continue
+        if clicked:
+            break
 
     if not clicked:
         log.warning(
@@ -285,11 +335,11 @@ def _navigate_to_date(page, day_offset: int) -> None:
             day_offset,
         )
 
-    # Wait for the new day's slots to render before scanning.
-    _wait_for_calendar(page)
+    # Wait for the new day's slots to render inside the calendar frame.
+    _wait_for_calendar(cal_frame)
 
 
-def _attempt_book_on_page(page, target_date) -> bool:
+def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
     """
     Find cells showing 'Reserve' inside the Badminton column and book
     the first one that falls within a preferred time window.
@@ -299,12 +349,16 @@ def _attempt_book_on_page(page, target_date) -> bool:
     Unavailable slots read 'UNAVAILABLE' or 'NONE AVAILABLE'.
     We anchor the regex (^Reserve$) so we don't accidentally match the
     'Reserve Now' confirmation button that appears later in the flow.
+
+    cal_frame is the Frame (or Page) that contains the calendar grid.
+    All slot searches are scoped to it so iframe content is reachable.
     """
     import re
 
     # Match cells whose full text is exactly "Reserve" (case-insensitive).
     # Excludes "UNAVAILABLE", "NONE AVAILABLE", and "Reserve Now" buttons.
-    available_slots = page.locator("a, td, div").filter(
+    # Scoped to cal_frame so iframe content is searched correctly.
+    available_slots = cal_frame.locator("a, td, div").filter(
         has_text=re.compile(r"^Reserve$", re.IGNORECASE)
     )
 
