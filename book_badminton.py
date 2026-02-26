@@ -355,6 +355,45 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
     """
     import re
 
+    # Extra settling time: _wait_for_calendar confirms the calendar structure
+    # is present, but Cloudflare's JS challenge may still be mutating the DOM.
+    # A short fixed sleep lets all post-render JS finish before we scan.
+    log.info("Waiting 4 s for page to fully settle before scanning…")
+    time.sleep(4)
+
+    # ── Diagnostic dump ──────────────────────────────────────────────────────
+    # Runs every scan so we can see exactly what Playwright sees on the page.
+    try:
+        body_text = cal_frame.inner_text("body")
+        has_reserve = "reserve" in body_text.lower()
+        log.info("Diagnostic: 'reserve' in page text = %s", has_reserve)
+
+        if has_reserve:
+            # Show up to 300 chars of context around the first occurrence
+            idx = body_text.lower().index("reserve")
+            start = max(0, idx - 120)
+            end   = min(len(body_text), idx + 180)
+            log.info("Diagnostic: context around first 'reserve': …%s…",
+                     body_text[start:end].replace("\n", " | "))
+        else:
+            # 'reserve' not present at all — show first 2 000 chars so we
+            # can see what is actually on the page
+            snippet = body_text[:2_000].replace("\n", " | ")
+            log.info("Diagnostic: page inner_text (first 2000 chars): %s", snippet)
+    except Exception as exc:
+        log.debug("Diagnostic inner_text dump failed: %s", exc)
+
+    try:
+        html = page.content()
+        has_reserve_html = "reserve" in html.lower()
+        log.info("Diagnostic: 'reserve' in page HTML  = %s", has_reserve_html)
+        if not has_reserve_html:
+            log.info("Diagnostic: page HTML snippet (first 3000 chars): %s",
+                     html[:3_000])
+    except Exception as exc:
+        log.debug("Diagnostic HTML dump failed: %s", exc)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Match cells whose full text is exactly "Reserve" (case-insensitive).
     # Excludes "UNAVAILABLE", "NONE AVAILABLE", and "Reserve Now" buttons.
     # Scoped to cal_frame so iframe content is searched correctly.
