@@ -88,20 +88,35 @@ def _slot_in_preferred_window(slot_hour: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def login(page) -> None:
-    """Log in to CourtReserve with email + password.
+    """Log in to CourtReserve via the booking calendar page.
 
-    CourtReserve uses a React SPA: the login form is rendered client-side, so
-    we must wait for each field to be visible before interacting with it.
-    The submit button is labelled "Continue" (not "Submit" / "Login").
-    After login the app redirects to the org booking page, so we navigate
-    directly to ORG_URL which triggers the login redirect automatically.
+    The calendar loads directly (no automatic login redirect).  A 'LOG IN'
+    button sits in the top-right nav bar.  Clicking it opens a modal/page
+    with the email+password form.  After submitting, the modal closes and
+    the LOG IN button disappears, confirming authentication.
     """
-    log.info("Navigating to booking URL (will redirect to login if not authenticated)…")
+    log.info("Loading booking calendar: %s", ORG_URL)
     page.goto(ORG_URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
 
-    # Wait for the email field rendered by the React app
+    # Detect the LOG IN nav button (case-insensitive text variants)
+    login_btn = page.locator(
+        'a:has-text("LOG IN"), button:has-text("LOG IN"), '
+        'a:has-text("Log In"), button:has-text("Log In")'
+    ).first
+
+    try:
+        login_btn.wait_for(state="visible", timeout=5_000)
+    except PlaywrightTimeout:
+        log.info("LOG IN button not found — already authenticated.")
+        return
+
+    log.info("Clicking LOG IN button…")
+    login_btn.click()
+
+    # Login form appears (modal or new view) — wait for the email field
     email_input = page.locator('input[placeholder="Enter Your Email"]')
-    email_input.wait_for(state="visible", timeout=20_000)
+    email_input.wait_for(state="visible", timeout=15_000)
     email_input.fill(EMAIL)
     log.debug("Filled email field.")
 
@@ -110,21 +125,26 @@ def login(page) -> None:
     password_input.fill(PASSWORD)
     log.debug("Filled password field.")
 
-    # The submit button is labelled "Continue"
+    # Submit — button is labelled "Continue"
     continue_btn = page.locator('button:has-text("Continue")')
     continue_btn.wait_for(state="visible", timeout=10_000)
     continue_btn.click()
 
-    # Wait until we are past the login screen (URL no longer contains "Login"
-    # or the bookings grid becomes visible)
-    page.wait_for_url(lambda url: "Login" not in url, timeout=20_000)
+    # Success: the LOG IN button disappears once authenticated
+    login_btn.wait_for(state="hidden", timeout=20_000)
     log.info("Logged in successfully.")
+
+    # If login redirected away from the calendar, return to it
+    if ORG_URL not in page.url:
+        log.info("Navigating back to booking calendar…")
+        page.goto(ORG_URL, wait_until="networkidle")
 
 
 def navigate_to_bookings(page) -> None:
-    """Navigate to the Kotofit bookings page."""
-    log.info("Opening bookings page: %s", ORG_URL)
-    page.goto(ORG_URL, wait_until="networkidle")
+    """Ensure we are on the booking calendar page."""
+    if ORG_URL not in page.url:
+        log.info("Navigating to booking calendar: %s", ORG_URL)
+        page.goto(ORG_URL, wait_until="networkidle")
 
 
 def select_sport(page) -> bool:
@@ -208,69 +228,175 @@ def _navigate_to_date(page, target_date) -> None:
 
 def _attempt_book_on_page(page, target_date) -> bool:
     """
-    Look for clickable 'available' slot buttons on the current page view.
-    Filter by preferred time windows and book the first matching one.
+    Find cells showing 'N Available' inside the Badminton column and book
+    the first one that falls within a preferred time window.
+
+    CourtReserve renders available courts as clickable cells (anchor tags or
+    divs) whose visible text is exactly 'N Available' (e.g. '1 Available').
+    Unavailable slots read 'UNAVAILABLE' or 'NONE AVAILABLE' — the regex
+    below excludes those by requiring a leading digit.
     """
-    # CourtReserve renders available slots as buttons / anchor tags with
-    # class names like 'available', 'open', etc.
-    slot_selectors = [
-        "td.reservationCell:not(.reserved):not(.disabled):not(.closed) a",
-        "div.available-slot a",
-        "a.available",
-        "button.slot-available",
-        ".k-scheduler-table td[data-slot-available='true']",
-        # Generic: any cell that is not grayed out
-        ".reservation-cell:not(.unavailable) a",
-    ]
+    import re
 
-    for sel in slot_selectors:
-        slots = page.locator(sel)
-        count = slots.count()
-        if count == 0:
-            continue
+    # Match "1 Available", "2 Available", etc. — NOT "UNAVAILABLE" / "NONE AVAILABLE"
+    available_slots = page.locator("a, td, div").filter(
+        has_text=re.compile(r"^\d+\s+Available$", re.IGNORECASE)
+    )
 
-        log.debug("Found %d potential slots with selector '%s'", count, sel)
+    count = available_slots.count()
+    log.info(
+        "Found %d 'N Available' cell(s) on %s.", count, target_date.strftime("%Y-%m-%d")
+    )
+    if count == 0:
+        return False
 
-        for i in range(count):
-            slot = slots.nth(i)
-            try:
-                slot_text = slot.inner_text(timeout=1_000).strip()
-                slot_hour = _parse_hour_from_text(slot_text)
-                if slot_hour is None:
-                    continue
-                if not _slot_in_preferred_window(slot_hour):
-                    log.debug(
-                        "Slot at %02d:00 outside preferred windows, skipping.", slot_hour
-                    )
-                    continue
+    for i in range(count):
+        slot = available_slots.nth(i)
+        try:
+            # Only act on slots inside a Badminton column (not Pickleball, etc.)
+            in_badminton_col = slot.evaluate(
+                """el => {
+                    // Walk up to the nearest table cell, then find its column index
+                    const cell = el.closest('td') || el.closest('[role="gridcell"]');
+                    if (!cell) return true;  // can't determine — allow it
 
+                    const row = cell.closest('tr') || cell.closest('[role="row"]');
+                    if (!row) return true;
+
+                    const colIndex = Array.from(row.children).indexOf(cell);
+
+                    // Find the header row
+                    const table = row.closest('table') || row.closest('[role="grid"]');
+                    if (!table) return true;
+
+                    const headerCells = table.querySelectorAll(
+                        'thead th, thead td, [role="columnheader"]'
+                    );
+                    if (!headerCells.length) return true;
+
+                    const header = headerCells[colIndex];
+                    if (!header) return true;
+
+                    const headerText = header.innerText.toLowerCase();
+                    // Accept "badminton" columns; exclude the compact/discounted variant
+                    return headerText.includes('badminton')
+                        && !headerText.includes('compact');
+                }"""
+            )
+
+            if not in_badminton_col:
+                log.debug("Slot %d is not in a Badminton column, skipping.", i)
+                continue
+
+            slot_hour = _get_slot_hour(slot)
+            if slot_hour is None:
+                log.debug("Slot %d: could not determine time, skipping.", i)
+                continue
+
+            if not _slot_in_preferred_window(slot_hour):
+                log.debug(
+                    "Slot %d at %02d:00 is outside preferred windows, skipping.",
+                    i,
+                    slot_hour,
+                )
+                continue
+
+            slot_text = slot.inner_text(timeout=1_000).strip()
+            log.info(
+                "Attempting to book: '%s' on %s at %02d:00…",
+                slot_text,
+                target_date,
+                slot_hour,
+            )
+            slot.click()
+            page.wait_for_load_state("networkidle")
+
+            confirmed = _confirm_booking(page)
+            if confirmed:
                 log.info(
-                    "Found matching slot on %s at %02d:00 — attempting to book…",
+                    "SUCCESS: Booked badminton court on %s at %02d:00",
                     target_date,
                     slot_hour,
                 )
-                slot.click()
-                page.wait_for_load_state("networkidle")
+                return True
 
-                # Confirm the booking dialog if one appears
-                confirmed = _confirm_booking(page)
-                if confirmed:
-                    log.info(
-                        "SUCCESS: Booked badminton court on %s at %02d:00",
-                        target_date,
-                        slot_hour,
-                    )
-                    return True
-                else:
-                    log.warning("Booking confirmation failed; going back.")
-                    page.go_back()
-                    page.wait_for_load_state("networkidle")
+            log.warning("Booking confirmation failed; going back.")
+            page.go_back()
+            page.wait_for_load_state("networkidle")
 
-            except Exception as exc:
-                log.debug("Error processing slot %d: %s", i, exc)
-                continue
+        except Exception as exc:
+            log.debug("Error processing slot %d: %s", i, exc)
+            continue
 
     return False
+
+
+def _get_slot_hour(slot_element) -> int | None:
+    """
+    Extract the starting hour for a slot by inspecting its DOM context.
+
+    Tries, in order:
+    1. data-time / data-start attribute on the element or its ancestors
+    2. The first cell of the enclosing <tr> (the row time-label)
+    3. Any ancestor element whose text contains a time pattern
+    """
+    try:
+        # Method 1 — data attributes
+        time_text = slot_element.evaluate(
+            """el => {
+                for (const attr of ['data-time', 'data-start', 'data-slot-time',
+                                    'data-begin', 'data-starttime']) {
+                    let node = el;
+                    while (node) {
+                        const val = node.getAttribute && node.getAttribute(attr);
+                        if (val) return val;
+                        node = node.parentElement;
+                    }
+                }
+                return null;
+            }"""
+        )
+        if time_text:
+            h = _parse_hour_from_text(time_text)
+            if h is not None:
+                return h
+
+        # Method 2 — first cell of the enclosing table row
+        row_label = slot_element.evaluate(
+            """el => {
+                const row = el.closest('tr') || el.closest('[role="row"]');
+                if (!row) return null;
+                const firstCell = row.querySelector(
+                    'td:first-child, th:first-child, [role="rowheader"]'
+                );
+                return firstCell ? firstCell.innerText.trim() : null;
+            }"""
+        )
+        if row_label:
+            h = _parse_hour_from_text(row_label)
+            if h is not None:
+                return h
+
+        # Method 3 — nearest ancestor containing a time string
+        ancestor_text = slot_element.evaluate(
+            r"""el => {
+                let node = el.parentElement;
+                for (let i = 0; i < 6; i++) {
+                    if (!node) break;
+                    if (/\d{1,2}:\d{2}\s*(AM|PM)/i.test(node.innerText || ''))
+                        return node.innerText;
+                    node = node.parentElement;
+                }
+                return null;
+            }"""
+        )
+        if ancestor_text:
+            return _parse_hour_from_text(ancestor_text)
+
+    except Exception as exc:
+        log.debug("_get_slot_hour error: %s", exc)
+
+    return None
 
 
 def _parse_hour_from_text(text: str):
