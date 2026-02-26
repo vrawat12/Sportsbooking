@@ -378,8 +378,6 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
     cal_frame is the Frame (or Page) that contains the calendar grid.
     All slot searches are scoped to it so iframe content is reachable.
     """
-    import re
-
     # Extra settling time: _wait_for_calendar confirms the calendar structure
     # is present, but Cloudflare's JS challenge may still be mutating the DOM.
     # A short fixed sleep lets all post-render JS finish before we scan.
@@ -417,14 +415,55 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
                      html[:3_000])
     except Exception as exc:
         log.debug("Diagnostic HTML dump failed: %s", exc)
+
+    # Dump the raw outerHTML of the first DOM node whose text is "Reserve" so
+    # we know the exact tag/attributes the locator needs to target.
+    try:
+        reserve_nodes = cal_frame.evaluate(
+            """() => {
+                const out = [];
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT
+                );
+                let node;
+                while ((node = walker.nextNode()) && out.length < 3) {
+                    if (node.textContent.trim().toLowerCase() === 'reserve') {
+                        const el = node.parentElement;
+                        out.push({
+                            tag:        el ? el.tagName : 'N/A',
+                            className:  el ? el.className : '',
+                            outerHTML:  el ? el.outerHTML.substring(0, 400) : '',
+                            parentTag:  el && el.parentElement ? el.parentElement.tagName : '',
+                            parentHTML: el && el.parentElement
+                                            ? el.parentElement.outerHTML.substring(0, 600)
+                                            : '',
+                        });
+                    }
+                }
+                return out;
+            }"""
+        )
+        for i, n in enumerate(reserve_nodes or []):
+            log.info(
+                "Diagnostic: Reserve node[%d] tag=<%s> class=%r outerHTML=%s",
+                i, n["tag"], n["className"], n["outerHTML"],
+            )
+            log.info(
+                "Diagnostic: Reserve node[%d] parent=<%s> parentHTML=%s",
+                i, n["parentTag"], n["parentHTML"],
+            )
+    except Exception as exc:
+        log.debug("Diagnostic Reserve DOM dump failed: %s", exc)
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Match cells whose full text is exactly "Reserve" (case-insensitive).
-    # Excludes "UNAVAILABLE", "NONE AVAILABLE", and "Reserve Now" buttons.
-    # Scoped to cal_frame so iframe content is searched correctly.
-    available_slots = cal_frame.locator("a, td, div").filter(
-        has_text=re.compile(r"^Reserve$", re.IGNORECASE)
-    )
+    # Use get_by_text with exact=True — Playwright's canonical exact-text
+    # locator.  Unlike locator().filter(has_text=regex), it:
+    #   - works on any HTML tag (not just a/td/div)
+    #   - normalises surrounding whitespace before comparing
+    #   - matches the visible (inner) text, not raw HTML
+    # "Reserve Now" buttons won't match because their text is not exactly
+    # "Reserve".
+    available_slots = cal_frame.get_by_text("Reserve", exact=True)
 
     count = available_slots.count()
     log.info(
