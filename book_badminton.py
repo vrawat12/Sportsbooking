@@ -150,18 +150,31 @@ def login(page) -> None:
     log.info("Logged in successfully.")
 
     # Let the post-login redirect finish before inspecting the URL.
-    # Using "load" rather than "networkidle" because CourtReserve is a
-    # React SPA that rarely reaches a true networkidle state.
+    # CourtReserve is a React SPA that fires a JS redirect immediately after
+    # the "load" event, so we wait for "load" first and then give the SPA an
+    # extra 2 s to settle so we don't call goto() while a navigation is
+    # already in flight (which causes ERR_ABORTED).
     try:
         page.wait_for_load_state("load", timeout=15_000)
     except PlaywrightTimeout:
-        pass  # proceed anyway if load takes too long
+        pass
+    time.sleep(2)  # buffer for any post-load SPA redirect to complete
 
     # If login redirected away from the booking calendar, go back.
-    # Use "domcontentloaded" to avoid ERR_ABORTED on SPA navigations.
+    # Retry once in case the first goto() is still aborted by a lingering
+    # in-flight navigation.
     if ORG_URL not in page.url:
         log.info("Navigating back to booking calendar…")
-        page.goto(ORG_URL, wait_until="domcontentloaded")
+        for _attempt in range(2):
+            try:
+                page.goto(ORG_URL, wait_until="domcontentloaded")
+                break
+            except Exception as exc:
+                if _attempt == 0 and "ERR_ABORTED" in str(exc):
+                    log.debug("goto aborted (SPA still navigating), retrying in 2 s…")
+                    time.sleep(2)
+                else:
+                    raise
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
         except PlaywrightTimeout:
