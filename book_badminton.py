@@ -125,8 +125,11 @@ def login(page) -> None:
     password_input.fill(PASSWORD)
     log.debug("Filled password field.")
 
-    # Submit — button is labelled "Continue"
-    continue_btn = page.locator('button:has-text("Continue")')
+    # Submit — target the primary "Continue" button explicitly to avoid
+    # matching the "Continue with Google" social-login button
+    continue_btn = page.locator(
+        'button[data-testid="Continue"][data-type="primary"]'
+    )
     continue_btn.wait_for(state="visible", timeout=10_000)
     continue_btn.click()
 
