@@ -32,7 +32,7 @@ EMAIL = os.getenv("KOTOFIT_EMAIL", "")
 PASSWORD = os.getenv("KOTOFIT_PASSWORD", "")
 ORG_URL = os.getenv(
     "COURTRESERVE_ORG_URL",
-    "https://app.courtreserve.com/Online/Reservations/Bookings",
+    "https://app.courtreserve.com/Online/Reservations/Bookings/8848?sId=21387",
 )
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "7"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
@@ -88,16 +88,36 @@ def _slot_in_preferred_window(slot_hour: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def login(page) -> None:
-    """Log in to CourtReserve with email + password."""
-    log.info("Navigating to login page…")
-    page.goto("https://app.courtreserve.com/Account/Login", wait_until="networkidle")
+    """Log in to CourtReserve with email + password.
 
-    page.fill('input[name="Email"], input[id="Email"], input[type="email"]', EMAIL)
-    page.fill('input[name="Password"], input[id="Password"], input[type="password"]', PASSWORD)
-    page.click('button[type="submit"], input[type="submit"]')
+    CourtReserve uses a React SPA: the login form is rendered client-side, so
+    we must wait for each field to be visible before interacting with it.
+    The submit button is labelled "Continue" (not "Submit" / "Login").
+    After login the app redirects to the org booking page, so we navigate
+    directly to ORG_URL which triggers the login redirect automatically.
+    """
+    log.info("Navigating to booking URL (will redirect to login if not authenticated)…")
+    page.goto(ORG_URL, wait_until="domcontentloaded")
 
-    # Wait for redirect away from the login page
-    page.wait_for_url(lambda url: "Login" not in url, timeout=15_000)
+    # Wait for the email field rendered by the React app
+    email_input = page.locator('input[placeholder="Enter Your Email"]')
+    email_input.wait_for(state="visible", timeout=20_000)
+    email_input.fill(EMAIL)
+    log.debug("Filled email field.")
+
+    password_input = page.locator('input[placeholder="Enter Your Password"]')
+    password_input.wait_for(state="visible", timeout=10_000)
+    password_input.fill(PASSWORD)
+    log.debug("Filled password field.")
+
+    # The submit button is labelled "Continue"
+    continue_btn = page.locator('button:has-text("Continue")')
+    continue_btn.wait_for(state="visible", timeout=10_000)
+    continue_btn.click()
+
+    # Wait until we are past the login screen (URL no longer contains "Login"
+    # or the bookings grid becomes visible)
+    page.wait_for_url(lambda url: "Login" not in url, timeout=20_000)
     log.info("Logged in successfully.")
 
 
