@@ -244,24 +244,26 @@ def _navigate_to_date(page, target_date) -> None:
 
 def _attempt_book_on_page(page, target_date) -> bool:
     """
-    Find cells showing 'N Available' inside the Badminton column and book
+    Find cells showing 'Reserve' inside the Badminton column and book
     the first one that falls within a preferred time window.
 
     CourtReserve renders available courts as clickable cells (anchor tags or
-    divs) whose visible text is exactly 'N Available' (e.g. '1 Available').
-    Unavailable slots read 'UNAVAILABLE' or 'NONE AVAILABLE' — the regex
-    below excludes those by requiring a leading digit.
+    divs) whose visible text is exactly 'Reserve'.
+    Unavailable slots read 'UNAVAILABLE' or 'NONE AVAILABLE'.
+    We anchor the regex (^Reserve$) so we don't accidentally match the
+    'Reserve Now' confirmation button that appears later in the flow.
     """
     import re
 
-    # Match "1 Available", "2 Available", etc. — NOT "UNAVAILABLE" / "NONE AVAILABLE"
+    # Match cells whose full text is exactly "Reserve" (case-insensitive).
+    # Excludes "UNAVAILABLE", "NONE AVAILABLE", and "Reserve Now" buttons.
     available_slots = page.locator("a, td, div").filter(
-        has_text=re.compile(r"^\d+\s+Available$", re.IGNORECASE)
+        has_text=re.compile(r"^Reserve$", re.IGNORECASE)
     )
 
     count = available_slots.count()
     log.info(
-        "Found %d 'N Available' cell(s) on %s.", count, target_date.strftime("%Y-%m-%d")
+        "Found %d 'Reserve' cell(s) on %s.", count, target_date.strftime("%Y-%m-%d")
     )
     if count == 0:
         return False
@@ -317,10 +319,8 @@ def _attempt_book_on_page(page, target_date) -> bool:
                 )
                 continue
 
-            slot_text = slot.inner_text(timeout=1_000).strip()
             log.info(
-                "Attempting to book: '%s' on %s at %02d:00…",
-                slot_text,
+                "Attempting to book 'Reserve' slot on %s at %02d:00…",
                 target_date,
                 slot_hour,
             )
