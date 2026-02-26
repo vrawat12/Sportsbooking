@@ -137,10 +137,23 @@ def login(page) -> None:
     login_btn.wait_for(state="hidden", timeout=20_000)
     log.info("Logged in successfully.")
 
-    # If login redirected away from the calendar, return to it
+    # Let the post-login redirect finish before inspecting the URL.
+    # Using "load" rather than "networkidle" because CourtReserve is a
+    # React SPA that rarely reaches a true networkidle state.
+    try:
+        page.wait_for_load_state("load", timeout=15_000)
+    except PlaywrightTimeout:
+        pass  # proceed anyway if load takes too long
+
+    # If login redirected away from the booking calendar, go back.
+    # Use "domcontentloaded" to avoid ERR_ABORTED on SPA navigations.
     if ORG_URL not in page.url:
         log.info("Navigating back to booking calendar…")
-        page.goto(ORG_URL, wait_until="networkidle")
+        page.goto(ORG_URL, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except PlaywrightTimeout:
+            pass  # SPA — networkidle may never fire; the page is usable anyway
 
 
 def navigate_to_bookings(page) -> None:
