@@ -1,23 +1,28 @@
 """
-Kotofit Badminton Slot Booking Automation
-==========================================
+Kotofit Badminton Slot Notifier
+================================
 Polls the CourtReserve booking page for Kotofit Jersey City (Brunswick St)
-and automatically books an available badminton court during your preferred
-time windows.
+every 30 minutes and sends a Telegram message when badminton courts are
+available between 6:00 PM and 9:30 PM (1-hour slots).
+
+No automatic booking is performed — the script only notifies you so you
+can decide whether to book.
 
 Prerequisites:
     pip install -r requirements.txt
     playwright install chromium
 
-Usage:
-    cp .env.example .env        # fill in your credentials and org URL
+Setup:
+    cp .env.example .env   # fill in credentials, org URL, and Telegram tokens
     python book_badminton.py
 """
 
 import os
 import time
+import json
 import random
 import logging
+import urllib.request
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -29,26 +34,25 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 load_dotenv()
 
-EMAIL = os.getenv("KOTOFIT_EMAIL", "")
+EMAIL    = os.getenv("KOTOFIT_EMAIL", "")
 PASSWORD = os.getenv("KOTOFIT_PASSWORD", "")
-ORG_URL = os.getenv(
+ORG_URL  = os.getenv(
     "COURTRESERVE_ORG_URL",
     "https://app.courtreserve.com/Online/Reservations/Bookings/8848?sId=21387",
 )
-DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "7"))
+DAYS_AHEAD     = int(os.getenv("DAYS_AHEAD", "7"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
-SPORT_TYPE = os.getenv("SPORT_TYPE", "badminton").lower()
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
-# Path where Playwright storage state (cookies + localStorage) is persisted
-# between runs so we avoid a fresh login every 30-minute cycle.
-COOKIES_FILE = os.getenv("COOKIES_FILE", "courtreserve_cookies.json")
+SPORT_TYPE     = os.getenv("SPORT_TYPE", "badminton").lower()
+HEADLESS       = os.getenv("HEADLESS", "false").lower() == "true"
+COOKIES_FILE   = os.getenv("COOKIES_FILE", "courtreserve_cookies.json")
 
-# Parse preferred time windows: "6,12,17,22" → [(6,12),(17,22)]
-_raw_windows = os.getenv("PREFERRED_TIME_WINDOWS", "6,12,17,22").split(",")
-PREFERRED_WINDOWS: list[tuple[int, int]] = [
-    (int(_raw_windows[i]), int(_raw_windows[i + 1]))
-    for i in range(0, len(_raw_windows) - 1, 2)
-]
+# Telegram — get a bot token from @BotFather, your chat ID from @userinfobot
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Evening slot window: only report slots whose START time is in [18:00, 21:30]
+_WINDOW_START_MINS = 18 * 60       # 6:00 PM
+_WINDOW_END_MINS   = 21 * 60 + 30  # 9:30 PM
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,6 +79,10 @@ def _validate_config() -> None:
         missing.append("KOTOFIT_PASSWORD")
     if "XXXX" in ORG_URL or not ORG_URL.startswith("http"):
         missing.append("COURTRESERVE_ORG_URL")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}\n"
@@ -82,14 +90,41 @@ def _validate_config() -> None:
         )
 
 
-def _slot_in_preferred_window(slot_hour: int) -> bool:
-    """Return True if slot_hour falls within any preferred window."""
-    return any(start <= slot_hour < end for start, end in PREFERRED_WINDOWS)
-
-
 def _human_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
     """Sleep a random interval to mimic human interaction timing."""
     time.sleep(random.uniform(min_s, max_s))
+
+
+def _send_telegram(text: str) -> None:
+    """Send a plain-text message via the Telegram Bot API."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                log.info("Telegram notification sent.")
+            else:
+                log.warning("Telegram API returned status %d", resp.status)
+    except Exception as exc:
+        log.warning("Failed to send Telegram notification: %s", exc)
+
+
+def _format_slot(hour: int, minute: int) -> str:
+    """Format a 1-hour slot starting at (hour, minute) in 12-hour time.
+
+    Example: (18, 30) → '6:30 PM – 7:30 PM'
+    """
+    def _fmt(h: int, m: int) -> str:
+        suffix = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m:02d} {suffix}"
+
+    return f"{_fmt(hour, minute)} – {_fmt(hour + 1, minute)}"
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +143,6 @@ def login(page) -> None:
     page.goto(ORG_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
 
-    # Detect the LOG IN nav button (case-insensitive text variants)
     login_btn = page.locator(
         'a:has-text("LOG IN"), button:has-text("LOG IN"), '
         'a:has-text("Log In"), button:has-text("Log In")'
@@ -124,7 +158,6 @@ def login(page) -> None:
     login_btn.click()
     _human_delay()  # wait for modal to animate in
 
-    # Login form appears (modal or new view) — wait for the email field
     email_input = page.locator('input[placeholder="Enter Your Email"]')
     email_input.wait_for(state="visible", timeout=15_000)
     email_input.fill(EMAIL)
@@ -137,15 +170,12 @@ def login(page) -> None:
     log.debug("Filled password field.")
     _human_delay()  # pause before submitting
 
-    # Submit — target the primary "Continue" button explicitly to avoid
-    # matching the "Continue with Google" social-login button
     continue_btn = page.locator(
         'button[data-testid="Continue"][data-type="primary"]'
     )
     continue_btn.wait_for(state="visible", timeout=10_000)
     continue_btn.click()
 
-    # Success: the LOG IN button disappears once authenticated
     login_btn.wait_for(state="hidden", timeout=20_000)
     log.info("Logged in successfully.")
 
@@ -189,11 +219,7 @@ def navigate_to_bookings(page) -> None:
 
 
 def select_sport(page) -> bool:
-    """
-    If there is a sport/court-type filter, select 'badminton'.
-    Returns True if a filter was found and set; False if not present.
-    """
-    # CourtReserve often has a dropdown or radio buttons for court type
+    """If there is a sport/court-type filter, select 'badminton'."""
     selectors = [
         'select[id*="sport" i]',
         'select[name*="sport" i]',
@@ -204,7 +230,6 @@ def select_sport(page) -> bool:
         try:
             el = page.locator(sel).first
             if el.count() > 0 and el.is_visible(timeout=2_000):
-                # Try to select by label containing 'badminton'
                 el.select_option(label=SPORT_TYPE.capitalize())
                 log.info("Selected sport filter: %s", SPORT_TYPE)
                 page.wait_for_load_state("networkidle")
@@ -217,30 +242,19 @@ def select_sport(page) -> bool:
 def _get_calendar_frame(page):
     """
     Detect which frame (iframe or main page) contains the booking calendar.
-
-    CourtReserve embeds the reservation grid inside an <iframe>.
-    This function:
-      - waits for any <iframe> tags to appear in the page
-      - logs the total number of iframes found (for debugging)
-      - probes each iframe for calendar content (Reserve / NONE AVAILABLE)
-      - returns the matching Frame, falling back to the main page if none found
-
-    Both Frame and Page expose identical .locator() / .wait_for_selector()
-    APIs so callers can treat the return value uniformly.
+    Returns the matching Frame, or the main page if no iframe matches.
     """
-    # Give the page a moment to create any iframes before enumerating
     try:
         page.wait_for_selector("iframe", timeout=10_000)
     except PlaywrightTimeout:
-        pass  # No iframes visible yet — will still enumerate page.frames
+        pass
 
-    all_frames = page.frames          # index 0 is always the main frame
+    all_frames = page.frames
     iframe_count = len(all_frames) - 1
     log.info("Found %d iframe(s) on the page.", iframe_count)
     for idx, frm in enumerate(all_frames[1:], start=1):
         log.debug("  iframe[%d] url=%s", idx, frm.url)
 
-    # Return the first iframe that contains calendar slot labels
     for idx, frm in enumerate(all_frames[1:], start=1):
         try:
             frm.wait_for_selector(
@@ -257,24 +271,13 @@ def _get_calendar_frame(page):
 
 
 def _wait_for_calendar(ctx) -> None:
-    """
-    Block until the calendar grid has rendered at least one slot cell.
-    ctx may be a Page or a Frame — both share the same selector API.
-
-    Looks for slot-label text ('Reserve' / 'NONE AVAILABLE') first, then
-    falls back to FullCalendar structural selectors.
-    """
-    # Most specific signal: a rendered slot label
+    """Block until the calendar grid has rendered at least one slot cell."""
     try:
-        ctx.wait_for_selector(
-            "text=/Reserve|NONE AVAILABLE/i",
-            timeout=15_000,
-        )
+        ctx.wait_for_selector("text=/Reserve|NONE AVAILABLE/i", timeout=15_000)
         return
     except PlaywrightTimeout:
         pass
 
-    # Structural fallback: any FullCalendar grid cell
     for sel in (".fc-widget-content", ".fc-time-grid td", ".fc-day-grid td",
                 "[class*='fc-slot']", "td.fc-agenda-slots"):
         try:
@@ -286,7 +289,6 @@ def _wait_for_calendar(ctx) -> None:
     log.debug("_wait_for_calendar: calendar may not have fully rendered")
 
 
-# Selectors for FullCalendar's "go to next day/week" button
 _NEXT_BTN_SELECTORS = [
     ".fc-next-button",
     "button.fc-button[title*='next' i]",
@@ -296,48 +298,11 @@ _NEXT_BTN_SELECTORS = [
 ]
 
 
-def find_and_book_slot(page) -> bool:
-    """
-    Scan the calendar/grid for available slots within preferred windows
-    across the next DAYS_AHEAD days.  Returns True if a booking was made.
-    """
-    today = datetime.today().date()
-
-    # Discover which frame holds the calendar (also logs iframe count).
-    # _get_calendar_frame waits for content to appear, so day_offset=0 needs
-    # no additional wait inside _navigate_to_date.
-    cal_frame = _get_calendar_frame(page)
-
-    for day_offset in range(DAYS_AHEAD):
-        target_date = today + timedelta(days=day_offset)
-        log.info("Checking availability for %s…", target_date.strftime("%A %Y-%m-%d"))
-
-        _navigate_to_date(page, cal_frame, day_offset)
-
-        booked = _attempt_book_on_page(page, cal_frame, target_date)
-        if booked:
-            return True
-
-    return False
-
-
 def _navigate_to_date(page, cal_frame, day_offset: int) -> None:
-    """
-    Advance the CourtReserve calendar to the correct date.
-
-    CourtReserve uses FullCalendar's next-arrow button (no free-form date
-    input).  We advance one day at a time through the loop: day_offset==0
-    means the calendar is already on today (no click needed); each subsequent
-    call clicks next once and waits for the new day to render.
-
-    The next-arrow may live inside the iframe or in the main page; we try
-    the calendar frame first and fall back to the main page.
-    """
+    """Advance the CourtReserve calendar to the correct date."""
     if day_offset == 0:
-        # _get_calendar_frame already confirmed the calendar is rendered.
         return
 
-    # Try to click the next-day arrow — search iframe first, then main page.
     clicked = False
     for search_ctx in (cal_frame, page):
         for sel in _NEXT_BTN_SELECTORS:
@@ -360,47 +325,120 @@ def _navigate_to_date(page, cal_frame, day_offset: int) -> None:
             day_offset,
         )
 
-    # Wait for the new day's slots to render inside the calendar frame.
     _wait_for_calendar(cal_frame)
 
 
-def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
+def _parse_slot_time(text: str) -> tuple[int, int] | None:
     """
-    Find cells showing 'Reserve' inside the Badminton column and book
-    the first one that falls within a preferred time window.
-
-    CourtReserve renders available courts as clickable cells (anchor tags or
-    divs) whose visible text is exactly 'Reserve'.
-    Unavailable slots read 'UNAVAILABLE' or 'NONE AVAILABLE'.
-    We anchor the regex (^Reserve$) so we don't accidentally match the
-    'Reserve Now' confirmation button that appears later in the flow.
-
-    cal_frame is the Frame (or Page) that contains the calendar grid.
-    All slot searches are scoped to it so iframe content is reachable.
+    Parse (hour_24, minute) from a slot label like '8:00 AM', '5:30 PM', '17:30'.
+    Returns None if parsing fails.
     """
-    # Extra settling time: _wait_for_calendar confirms the calendar structure
-    # is present, but Cloudflare's JS challenge may still be mutating the DOM.
-    # A short fixed sleep lets all post-render JS finish before we scan.
+    import re
+
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", text, re.IGNORECASE)
+    if not m:
+        return None
+
+    hour     = int(m.group(1))
+    minute   = int(m.group(2))
+    meridiem = (m.group(3) or "").upper()
+
+    if meridiem == "PM" and hour != 12:
+        hour += 12
+    elif meridiem == "AM" and hour == 12:
+        hour = 0
+
+    return (hour, minute)
+
+
+def _get_slot_time(slot_element) -> tuple[int, int] | None:
+    """
+    Extract the (hour, minute) for a slot by inspecting its DOM context.
+
+    Tries, in order:
+    1. data-time / data-start attribute on the element or its ancestors
+    2. The first cell of the enclosing <tr> (the row time-label)
+    3. Any ancestor element whose text contains a time pattern
+    """
+    try:
+        time_text = slot_element.evaluate(
+            """el => {
+                for (const attr of ['data-time', 'data-start', 'data-slot-time',
+                                    'data-begin', 'data-starttime']) {
+                    let node = el;
+                    while (node) {
+                        const val = node.getAttribute && node.getAttribute(attr);
+                        if (val) return val;
+                        node = node.parentElement;
+                    }
+                }
+                return null;
+            }"""
+        )
+        if time_text:
+            t = _parse_slot_time(time_text)
+            if t is not None:
+                return t
+
+        row_label = slot_element.evaluate(
+            """el => {
+                const row = el.closest('tr') || el.closest('[role="row"]');
+                if (!row) return null;
+                const firstCell = row.querySelector(
+                    'td:first-child, th:first-child, [role="rowheader"]'
+                );
+                return firstCell ? firstCell.innerText.trim() : null;
+            }"""
+        )
+        if row_label:
+            t = _parse_slot_time(row_label)
+            if t is not None:
+                return t
+
+        ancestor_text = slot_element.evaluate(
+            r"""el => {
+                let node = el.parentElement;
+                for (let i = 0; i < 6; i++) {
+                    if (!node) break;
+                    if (/\d{1,2}:\d{2}\s*(AM|PM)/i.test(node.innerText || ''))
+                        return node.innerText;
+                    node = node.parentElement;
+                }
+                return null;
+            }"""
+        )
+        if ancestor_text:
+            return _parse_slot_time(ancestor_text)
+
+    except Exception as exc:
+        log.debug("_get_slot_time error: %s", exc)
+
+    return None
+
+
+def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
+    """
+    Find all available (Reserve) slots on the current calendar day whose
+    start time falls between 6:00 PM and 9:30 PM.
+
+    Returns a list of formatted strings like "6:00 PM – 7:00 PM".
+    No clicking or booking is performed.
+    """
     log.info("Waiting 4 s for page to fully settle before scanning…")
     time.sleep(4)
 
     # ── Diagnostic dump ──────────────────────────────────────────────────────
-    # Runs every scan so we can see exactly what Playwright sees on the page.
     try:
         body_text = cal_frame.inner_text("body")
         has_reserve = "reserve" in body_text.lower()
         log.info("Diagnostic: 'reserve' in page text = %s", has_reserve)
-
         if has_reserve:
-            # Show up to 300 chars of context around the first occurrence
             idx = body_text.lower().index("reserve")
             start = max(0, idx - 120)
             end   = min(len(body_text), idx + 180)
             log.info("Diagnostic: context around first 'reserve': …%s…",
                      body_text[start:end].replace("\n", " | "))
         else:
-            # 'reserve' not present at all — show first 2 000 chars so we
-            # can see what is actually on the page
             snippet = body_text[:2_000].replace("\n", " | ")
             log.info("Diagnostic: page inner_text (first 2000 chars): %s", snippet)
     except Exception as exc:
@@ -411,13 +449,10 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
         has_reserve_html = "reserve" in html.lower()
         log.info("Diagnostic: 'reserve' in page HTML  = %s", has_reserve_html)
         if not has_reserve_html:
-            log.info("Diagnostic: page HTML snippet (first 3000 chars): %s",
-                     html[:3_000])
+            log.info("Diagnostic: page HTML snippet (first 3000 chars): %s", html[:3_000])
     except Exception as exc:
         log.debug("Diagnostic HTML dump failed: %s", exc)
 
-    # Dump the raw outerHTML of the first DOM node whose text is "Reserve" so
-    # we know the exact tag/attributes the locator needs to target.
     try:
         reserve_nodes = cal_frame.evaluate(
             """() => {
@@ -435,8 +470,7 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
                             outerHTML:  el ? el.outerHTML.substring(0, 400) : '',
                             parentTag:  el && el.parentElement ? el.parentElement.tagName : '',
                             parentHTML: el && el.parentElement
-                                            ? el.parentElement.outerHTML.substring(0, 600)
-                                            : '',
+                                            ? el.parentElement.outerHTML.substring(0, 600) : '',
                         });
                     }
                 }
@@ -444,246 +478,73 @@ def _attempt_book_on_page(page, cal_frame, target_date) -> bool:
             }"""
         )
         for i, n in enumerate(reserve_nodes or []):
-            log.info(
-                "Diagnostic: Reserve node[%d] tag=<%s> class=%r outerHTML=%s",
-                i, n["tag"], n["className"], n["outerHTML"],
-            )
-            log.info(
-                "Diagnostic: Reserve node[%d] parent=<%s> parentHTML=%s",
-                i, n["parentTag"], n["parentHTML"],
-            )
+            log.info("Diagnostic: Reserve node[%d] tag=<%s> class=%r outerHTML=%s",
+                     i, n["tag"], n["className"], n["outerHTML"])
+            log.info("Diagnostic: Reserve node[%d] parent=<%s> parentHTML=%s",
+                     i, n["parentTag"], n["parentHTML"])
     except Exception as exc:
         log.debug("Diagnostic Reserve DOM dump failed: %s", exc)
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Use get_by_text with exact=True — Playwright's canonical exact-text
-    # locator.  Unlike locator().filter(has_text=regex), it:
-    #   - works on any HTML tag (not just a/td/div)
-    #   - normalises surrounding whitespace before comparing
-    #   - matches the visible (inner) text, not raw HTML
-    # "Reserve Now" buttons won't match because their text is not exactly
-    # "Reserve".
     available_slots = cal_frame.get_by_text("Reserve", exact=True)
-
     count = available_slots.count()
-    log.info(
-        "Found %d 'Reserve' cell(s) on %s.", count, target_date.strftime("%Y-%m-%d")
-    )
+    log.info("Found %d 'Reserve' cell(s) on %s.", count, target_date.strftime("%Y-%m-%d"))
     if count == 0:
-        return False
+        return []
 
+    found = []
     for i in range(count):
         slot = available_slots.nth(i)
         try:
-            # Only act on slots inside a Badminton column (not Pickleball, etc.)
-            in_badminton_col = slot.evaluate(
-                """el => {
-                    // Walk up to the nearest table cell, then find its column index
-                    const cell = el.closest('td') || el.closest('[role="gridcell"]');
-                    if (!cell) return true;  // can't determine — allow it
-
-                    const row = cell.closest('tr') || cell.closest('[role="row"]');
-                    if (!row) return true;
-
-                    const colIndex = Array.from(row.children).indexOf(cell);
-
-                    // Find the header row
-                    const table = row.closest('table') || row.closest('[role="grid"]');
-                    if (!table) return true;
-
-                    const headerCells = table.querySelectorAll(
-                        'thead th, thead td, [role="columnheader"]'
-                    );
-                    if (!headerCells.length) return true;
-
-                    const header = headerCells[colIndex];
-                    if (!header) return true;
-
-                    const headerText = header.innerText.toLowerCase();
-                    // Accept "badminton" columns; exclude the compact/discounted variant
-                    return headerText.includes('badminton')
-                        && !headerText.includes('compact');
-                }"""
-            )
-
-            if not in_badminton_col:
-                log.debug("Slot %d is not in a Badminton column, skipping.", i)
-                continue
-
-            slot_hour = _get_slot_hour(slot)
-            if slot_hour is None:
+            slot_time = _get_slot_time(slot)
+            if slot_time is None:
                 log.debug("Slot %d: could not determine time, skipping.", i)
                 continue
 
-            if not _slot_in_preferred_window(slot_hour):
+            h, m = slot_time
+            if not (_WINDOW_START_MINS <= h * 60 + m <= _WINDOW_END_MINS):
                 log.debug(
-                    "Slot %d at %02d:00 is outside preferred windows, skipping.",
-                    i,
-                    slot_hour,
+                    "Slot %d at %02d:%02d is outside 6–9:30 PM window, skipping.",
+                    i, h, m,
                 )
                 continue
 
-            log.info(
-                "Attempting to book 'Reserve' slot on %s at %02d:00…",
-                target_date,
-                slot_hour,
-            )
-            slot.click()
-            page.wait_for_load_state("networkidle")
-
-            confirmed = _confirm_booking(page)
-            if confirmed:
-                log.info(
-                    "SUCCESS: Booked badminton court on %s at %02d:00",
-                    target_date,
-                    slot_hour,
-                )
-                return True
-
-            log.warning("Booking confirmation failed; going back.")
-            page.go_back()
-            page.wait_for_load_state("networkidle")
-
+            found.append(_format_slot(h, m))
         except Exception as exc:
             log.debug("Error processing slot %d: %s", i, exc)
-            continue
 
-    return False
+    log.info(
+        "Found %d evening slot(s) on %s.", len(found), target_date.strftime("%Y-%m-%d")
+    )
+    return found
 
 
-def _get_slot_hour(slot_element) -> int | None:
+def find_available_slots(page) -> dict:
     """
-    Extract the starting hour for a slot by inspecting its DOM context.
+    Scan the calendar across the next DAYS_AHEAD days for available evening
+    badminton slots (6:00 PM – 9:30 PM start times).
 
-    Tries, in order:
-    1. data-time / data-start attribute on the element or its ancestors
-    2. The first cell of the enclosing <tr> (the row time-label)
-    3. Any ancestor element whose text contains a time pattern
+    Returns a dict mapping date labels to lists of formatted slot strings:
+        {"Thursday Feb 26": ["6:00 PM – 7:00 PM", "7:30 PM – 8:30 PM"], ...}
+    An empty dict means no slots were found across all scanned days.
     """
-    try:
-        # Method 1 — data attributes
-        time_text = slot_element.evaluate(
-            """el => {
-                for (const attr of ['data-time', 'data-start', 'data-slot-time',
-                                    'data-begin', 'data-starttime']) {
-                    let node = el;
-                    while (node) {
-                        const val = node.getAttribute && node.getAttribute(attr);
-                        if (val) return val;
-                        node = node.parentElement;
-                    }
-                }
-                return null;
-            }"""
-        )
-        if time_text:
-            h = _parse_hour_from_text(time_text)
-            if h is not None:
-                return h
+    today = datetime.today().date()
+    cal_frame = _get_calendar_frame(page)
+    results = {}
 
-        # Method 2 — first cell of the enclosing table row
-        row_label = slot_element.evaluate(
-            """el => {
-                const row = el.closest('tr') || el.closest('[role="row"]');
-                if (!row) return null;
-                const firstCell = row.querySelector(
-                    'td:first-child, th:first-child, [role="rowheader"]'
-                );
-                return firstCell ? firstCell.innerText.trim() : null;
-            }"""
-        )
-        if row_label:
-            h = _parse_hour_from_text(row_label)
-            if h is not None:
-                return h
+    for day_offset in range(DAYS_AHEAD):
+        target_date = today + timedelta(days=day_offset)
+        log.info("Checking availability for %s…", target_date.strftime("%A %Y-%m-%d"))
 
-        # Method 3 — nearest ancestor containing a time string
-        ancestor_text = slot_element.evaluate(
-            r"""el => {
-                let node = el.parentElement;
-                for (let i = 0; i < 6; i++) {
-                    if (!node) break;
-                    if (/\d{1,2}:\d{2}\s*(AM|PM)/i.test(node.innerText || ''))
-                        return node.innerText;
-                    node = node.parentElement;
-                }
-                return null;
-            }"""
-        )
-        if ancestor_text:
-            return _parse_hour_from_text(ancestor_text)
+        _navigate_to_date(page, cal_frame, day_offset)
+        slots = _collect_slots_on_page(page, cal_frame, target_date)
 
-    except Exception as exc:
-        log.debug("_get_slot_hour error: %s", exc)
+        if slots:
+            # Cross-platform label without leading zero: "Thursday Feb 26"
+            date_label = target_date.strftime("%A %b ") + str(target_date.day)
+            results[date_label] = slots
 
-    return None
-
-
-def _parse_hour_from_text(text: str):
-    """
-    Parse the starting hour (int, 0-23) from a slot label like
-    '8:00 AM', '5:30 PM', '17:00', etc.
-    Returns None if parsing fails.
-    """
-    import re
-
-    # Match patterns: "8:00 AM", "5:30 PM", "17:00"
-    m = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", text, re.IGNORECASE)
-    if not m:
-        return None
-
-    hour = int(m.group(1))
-    meridiem = (m.group(3) or "").upper()
-
-    if meridiem == "PM" and hour != 12:
-        hour += 12
-    elif meridiem == "AM" and hour == 12:
-        hour = 0
-
-    return hour
-
-
-def _confirm_booking(page) -> bool:
-    """
-    Handle any confirmation dialog / form that CourtReserve shows after
-    clicking a slot.  Returns True if booking was successfully submitted.
-    """
-    confirm_selectors = [
-        'button:has-text("Confirm")',
-        'button:has-text("Book")',
-        'button:has-text("Reserve")',
-        'input[value="Confirm"]',
-        'input[value="Book"]',
-        '#confirmReservation',
-        '.btn-confirm',
-    ]
-
-    for sel in confirm_selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.count() > 0 and btn.is_visible(timeout=3_000):
-                btn.click()
-                page.wait_for_load_state("networkidle")
-
-                # Check for a success message
-                success_keywords = ["confirmed", "success", "booked", "reservation"]
-                page_text = page.content().lower()
-                if any(kw in page_text for kw in success_keywords):
-                    return True
-        except Exception:
-            pass
-
-    # If no confirm button found, assume the click already booked it
-    # and check for a success indicator
-    try:
-        page.wait_for_selector(
-            'text=/confirmed|success|booked|reservation/i', timeout=5_000
-        )
-        return True
-    except PlaywrightTimeout:
-        pass
-
-    return False
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -691,13 +552,16 @@ def _confirm_booking(page) -> bool:
 # ---------------------------------------------------------------------------
 
 def run_once() -> bool:
-    """Run a single check-and-book cycle.  Returns True if a slot was booked."""
+    """
+    Run a single scan cycle.
+    Sends a Telegram message if evening slots are found.
+    Returns True if any slots were found and notified.
+    """
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=HEADLESS,
             args=[
                 "--window-size=1280,900",
-                # Removes the CDP "Automation" flag that Cloudflare detects.
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ],
@@ -713,33 +577,38 @@ def run_once() -> bool:
             locale="en-US",
             timezone_id="America/New_York",
         )
-        # Reuse saved cookies/localStorage from the previous run so we skip
-        # the login flow entirely on most cycles.
         if os.path.exists(COOKIES_FILE):
             ctx_kwargs["storage_state"] = COOKIES_FILE
             log.info("Loaded saved session from %s", COOKIES_FILE)
 
         context = browser.new_context(**ctx_kwargs)
-
-        # Mask navigator.webdriver — the primary JS property Cloudflare
-        # checks to distinguish headless browsers from real users.
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
-
         page = context.new_page()
 
         try:
             login(page)
-            # Always persist the session after login (or when already
-            # authenticated via saved cookies) so the next cycle is cookie-warm.
             page.context.storage_state(path=COOKIES_FILE)
             log.info("Saved session cookies to %s", COOKIES_FILE)
 
             navigate_to_bookings(page)
             select_sport(page)
-            booked = find_and_book_slot(page)
-            return booked
+            results = find_available_slots(page)
+
+            if results:
+                lines = []
+                for date_label, slots in results.items():
+                    lines.append(f"Available badminton slots for {date_label}:")
+                    for j, slot_str in enumerate(slots, 1):
+                        lines.append(f"  {j}. {slot_str}")
+                message = "\n".join(lines)
+                log.info("Sending Telegram notification:\n%s", message)
+                _send_telegram(message)
+                return True
+
+            return False
+
         except PlaywrightTimeout as exc:
             log.error("Timed out during automation: %s", exc)
         except Exception as exc:
@@ -754,13 +623,10 @@ def run_once() -> bool:
 def main() -> None:
     _validate_config()
 
-    log.info("=== Kotofit Badminton Auto-Booker ===")
+    log.info("=== Kotofit Badminton Slot Notifier ===")
     log.info("Location : Kotofit Jersey City – Brunswick St")
     log.info("Sport    : %s", SPORT_TYPE)
-    log.info(
-        "Windows  : %s",
-        ", ".join(f"{s:02d}:00–{e:02d}:00" for s, e in PREFERRED_WINDOWS),
-    )
+    log.info("Window   : 6:00 PM – 9:30 PM start (1-hour slots)")
     log.info("Interval : every %d minutes", CHECK_INTERVAL // 60)
     log.info("Headless : %s", HEADLESS)
     log.info("")
@@ -770,16 +636,14 @@ def main() -> None:
         attempt += 1
         log.info("--- Check #%d at %s ---", attempt, datetime.now().strftime("%H:%M:%S"))
 
-        booked = run_once()
+        found = run_once()
 
-        if booked:
-            log.info("Slot booked! Exiting – check your email for the PIN code.")
-            break
+        if found:
+            log.info("Telegram notification sent for available slots.")
+        else:
+            log.info("No available evening slots found.")
 
-        log.info(
-            "No suitable slot booked. Next check in %d minutes.",
-            CHECK_INTERVAL // 60,
-        )
+        log.info("Next check in %d minutes.", CHECK_INTERVAL // 60)
         time.sleep(CHECK_INTERVAL)
 
 
