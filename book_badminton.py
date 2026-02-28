@@ -1,23 +1,26 @@
 """
-Kotofit Badminton Slot Notifier
-================================
-Polls the CourtReserve booking page for Kotofit Jersey City (Brunswick St)
-every 30 minutes and sends a Telegram message when badminton courts are
-available between 6:00 PM and 9:30 PM (1-hour slots).
-
-No automatic booking is performed — the script only notifies you so you
-can decide whether to book.
+Kotofit Badminton Booking Assistant
+=====================================
+Polls CourtReserve every 30 minutes for available Badminton courts between
+6:00 PM and 9:30 PM.  When slots are found they are sent to a Claude AI
+assistant which crafts a friendly Telegram message.  The user can reply
+naturally; when they confirm a slot Claude emits BOOK:DATE:TIME and the
+script books it automatically via Playwright.
 
 Prerequisites:
     pip install -r requirements.txt
     playwright install chromium
 
 Setup:
-    cp .env.example .env   # fill in credentials, org URL, and Telegram tokens
+    cp .env.example .env   # fill in all credentials
     python book_badminton.py
 """
 
+import asyncio
 import os
+import queue
+import re
+import threading
 import time
 import json
 import random
@@ -26,8 +29,11 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 
+import anthropic
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,19 +47,18 @@ ORG_URL  = os.getenv(
     "COURTRESERVE_ORG_URL",
     "https://app.courtreserve.com/Online/Reservations/Bookings/8848?sId=21387",
 )
-DAYS_AHEAD     = int(os.getenv("DAYS_AHEAD", "7"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
-SPORT_TYPE     = os.getenv("SPORT_TYPE", "badminton").lower()
-HEADLESS       = os.getenv("HEADLESS", "false").lower() == "true"
-COOKIES_FILE   = os.getenv("COOKIES_FILE", "courtreserve_cookies.json")
+DAYS_AHEAD          = int(os.getenv("DAYS_AHEAD", "7"))
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
+SPORT_TYPE          = os.getenv("SPORT_TYPE", "badminton").lower()
+HEADLESS            = os.getenv("HEADLESS", "false").lower() == "true"
+COOKIES_FILE        = os.getenv("COOKIES_FILE", "courtreserve_cookies.json")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Telegram — get a bot token from @BotFather, your chat ID from @userinfobot
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Evening slot window: only report slots whose START time is in [18:00, 21:30]
-_WINDOW_START_MINS = 18 * 60       # 6:00 PM
-_WINDOW_END_MINS   = 21 * 60 + 30  # 9:30 PM
+# Evening window: start times in [18:00, 21:30]
+_WINDOW_START_MINS = 18 * 60
+_WINDOW_END_MINS   = 21 * 60 + 30
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,13 +71,129 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Global state  (set at startup, read-only afterwards except _conversation)
+# ---------------------------------------------------------------------------
+
+_anthropic_client: anthropic.Anthropic | None = None
+
+# Conversation history: list of {"role": "user"|"assistant", "content": str}
+_conversation: list[dict] = []
+_conversation_lock = threading.Lock()
+
+# Set once the Telegram Application's event loop is running
+_bot_app: Application | None = None
+_bot_loop: asyncio.AbstractEventLoop | None = None
+_bot_ready = threading.Event()   # scan thread waits on this before first notification
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Claude system prompt (provided by the user)
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = (
+    "You are a helpful badminton court booking assistant for Kotofit Jersey City. "
+    "You have access to available court slots and help the user pick and confirm one. "
+    "Be conversational and friendly but concise. "
+    "When the user confirms a specific slot, respond with EXACTLY this format so the "
+    "system can parse it: BOOK:2026-03-01:18:00 (BOOK:DATE:TIME in 24hr format). "
+    "If no slots are available tell the user politely."
+)
+
+# ---------------------------------------------------------------------------
+# Claude helpers
+# ---------------------------------------------------------------------------
+
+def _call_claude(user_message: str) -> str:
+    """Thread-safe call to Claude, maintaining conversation history."""
+    with _conversation_lock:
+        _conversation.append({"role": "user", "content": user_message})
+        response = _anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=list(_conversation),
+        )
+        reply = response.content[0].text
+        _conversation.append({"role": "assistant", "content": reply})
+        log.debug("Claude reply: %s", reply[:200])
+        return reply
+
+
+def _parse_booking(text: str) -> tuple[str | None, str | None]:
+    """Return (date_str, time_24) if text contains BOOK:DATE:TIME, else (None, None)."""
+    m = re.search(r"BOOK:(\d{4}-\d{2}-\d{2}):(\d{2}:\d{2})", text)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
+def _reset_conversation() -> None:
+    with _conversation_lock:
+        _conversation.clear()
+
+# ---------------------------------------------------------------------------
+# Telegram send helper (used from non-async threads)
+# ---------------------------------------------------------------------------
+
+def _tg_send(chat_id: str | int, text: str) -> None:
+    """Send a Telegram message from any thread via the bot's event loop."""
+    if _bot_loop is None or _bot_app is None:
+        log.warning("Bot not ready — cannot send: %s", text[:80])
+        return
+    future = asyncio.run_coroutine_threadsafe(
+        _bot_app.bot.send_message(chat_id=int(chat_id), text=text),
+        _bot_loop,
+    )
+    try:
+        future.result(timeout=30)
+    except Exception as exc:
+        log.warning("_tg_send failed: %s", exc)
+
+# ---------------------------------------------------------------------------
+# Telegram async handlers
+# ---------------------------------------------------------------------------
+
+async def _post_init(app: Application) -> None:
+    """Called once the bot's event loop is running — capture the loop reference."""
+    global _bot_loop
+    _bot_loop = asyncio.get_running_loop()
+    _bot_ready.set()
+    log.info("Telegram bot ready. Listening for messages…")
+
+
+async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive a user Telegram message, pass to Claude, act on the reply."""
+    user_text = update.message.text
+    chat_id   = update.effective_chat.id
+    log.info("Telegram ← %r", user_text[:120])
+
+    # Run Claude synchronously in the default thread pool so the event loop
+    # is not blocked during the Anthropic API call.
+    loop  = asyncio.get_running_loop()
+    reply = await loop.run_in_executor(None, _call_claude, user_text)
+    log.info("Claude  → %r", reply[:120])
+
+    date_str, time_24 = _parse_booking(reply)
+    if date_str and time_24:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Got it! Booking Badminton on {date_str} at {time_24} right now…",
+        )
+        # Spawn a daemon thread so booking doesn't block the event loop
+        threading.Thread(
+            target=_book_and_notify,
+            args=(date_str, time_24, chat_id),
+            daemon=True,
+            name="booking",
+        ).start()
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+# ---------------------------------------------------------------------------
+# Misc helpers
 # ---------------------------------------------------------------------------
 
 def _validate_config() -> None:
-    """Abort early if required env vars are missing."""
     missing = []
     if not EMAIL:
         missing.append("KOTOFIT_EMAIL")
@@ -84,6 +205,8 @@ def _validate_config() -> None:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}\n"
@@ -92,62 +215,64 @@ def _validate_config() -> None:
 
 
 def _human_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
-    """Sleep a random interval to mimic human interaction timing."""
     time.sleep(random.uniform(min_s, max_s))
 
 
-def _send_telegram(text: str) -> None:
-    """Send a plain-text message via the Telegram Bot API."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # ensure_ascii=False encodes emoji as UTF-8 bytes rather than broken
-    # surrogate-pair escape sequences (\ud83d\udcc5) that cause HTTP 400.
-    payload = json.dumps(
-        {"chat_id": TELEGRAM_CHAT_ID, "text": text}, ensure_ascii=False
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    log.info("Calling Telegram API (chat_id=%s, %d chars)", TELEGRAM_CHAT_ID, len(text))
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                log.info("Telegram notification sent.")
-            else:
-                log.warning("Telegram API returned status %d", resp.status)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        log.warning("Telegram HTTP %d error: %s", exc.code, body[:500])
-    except Exception as exc:
-        log.warning("Failed to send Telegram notification: %s", exc)
-
-
 def _format_slot(hour: int, minute: int) -> str:
-    """Format a 1-hour slot starting at (hour, minute) in 12-hour time.
-
-    Example: (18, 30) → '6:30 PM – 7:30 PM'
-    """
+    """'6:30 PM – 7:30 PM' for a 1-hour slot starting at (hour, minute)."""
     def _fmt(h: int, m: int) -> str:
         suffix = "AM" if h < 12 else "PM"
         h12 = h % 12 or 12
         return f"{h12}:{m:02d} {suffix}"
-
     return f"{_fmt(hour, minute)} – {_fmt(hour + 1, minute)}"
 
 
+def _time_to_data_time(hour: int, minute: int) -> str:
+    """Convert 24-h (18, 0) to CourtReserve data-time format '6:00 PM'."""
+    suffix = "AM" if hour < 12 else "PM"
+    h12 = hour % 12 or 12
+    return f"{h12}:{minute:02d} {suffix}"
+
 # ---------------------------------------------------------------------------
-# Core automation
+# Playwright browser setup (shared by scan and booking sessions)
+# ---------------------------------------------------------------------------
+
+def _new_browser_context(pw):
+    """Launch Chromium and return (browser, context, page)."""
+    browser = pw.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--window-size=1280,900",
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+    )
+    ctx_kwargs = dict(
+        viewport={"width": 1280, "height": 900},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        locale="en-US",
+        timezone_id="America/New_York",
+    )
+    if os.path.exists(COOKIES_FILE):
+        ctx_kwargs["storage_state"] = COOKIES_FILE
+        log.info("Loaded saved session from %s", COOKIES_FILE)
+    context = browser.new_context(**ctx_kwargs)
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    page = context.new_page()
+    return browser, context, page
+
+# ---------------------------------------------------------------------------
+# Core Playwright automation helpers
 # ---------------------------------------------------------------------------
 
 def login(page) -> None:
-    """Log in to CourtReserve via the booking calendar page.
-
-    The calendar loads directly (no automatic login redirect).  A 'LOG IN'
-    button sits in the top-right nav bar.  Clicking it opens a modal/page
-    with the email+password form.  After submitting, the modal closes and
-    the LOG IN button disappears, confirming authentication.
-    """
+    """Log in to CourtReserve, or return immediately if already authenticated."""
     log.info("Loading booking calendar: %s", ORG_URL)
     page.goto(ORG_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
@@ -156,7 +281,6 @@ def login(page) -> None:
         'a:has-text("LOG IN"), button:has-text("LOG IN"), '
         'a:has-text("Log In"), button:has-text("Log In")'
     ).first
-
     try:
         login_btn.wait_for(state="visible", timeout=5_000)
     except PlaywrightTimeout:
@@ -165,43 +289,31 @@ def login(page) -> None:
 
     log.info("Clicking LOG IN button…")
     login_btn.click()
-    _human_delay()  # wait for modal to animate in
+    _human_delay()
 
     email_input = page.locator('input[placeholder="Enter Your Email"]')
     email_input.wait_for(state="visible", timeout=15_000)
     email_input.fill(EMAIL)
-    log.debug("Filled email field.")
-    _human_delay()  # pause between fields, like a human tabbing over
+    _human_delay()
 
     password_input = page.locator('input[placeholder="Enter Your Password"]')
     password_input.wait_for(state="visible", timeout=10_000)
     password_input.fill(PASSWORD)
-    log.debug("Filled password field.")
-    _human_delay()  # pause before submitting
+    _human_delay()
 
-    continue_btn = page.locator(
-        'button[data-testid="Continue"][data-type="primary"]'
-    )
+    continue_btn = page.locator('button[data-testid="Continue"][data-type="primary"]')
     continue_btn.wait_for(state="visible", timeout=10_000)
     continue_btn.click()
 
     login_btn.wait_for(state="hidden", timeout=20_000)
     log.info("Logged in successfully.")
 
-    # Let the post-login redirect finish before inspecting the URL.
-    # CourtReserve is a React SPA that fires a JS redirect immediately after
-    # the "load" event, so we wait for "load" first and then give the SPA an
-    # extra 2 s to settle so we don't call goto() while a navigation is
-    # already in flight (which causes ERR_ABORTED).
     try:
         page.wait_for_load_state("load", timeout=15_000)
     except PlaywrightTimeout:
         pass
-    time.sleep(2)  # buffer for any post-load SPA redirect to complete
+    time.sleep(2)
 
-    # If login redirected away from the booking calendar, go back.
-    # Retry once in case the first goto() is still aborted by a lingering
-    # in-flight navigation.
     if ORG_URL not in page.url:
         log.info("Navigating back to booking calendar…")
         for _attempt in range(2):
@@ -210,32 +322,24 @@ def login(page) -> None:
                 break
             except Exception as exc:
                 if _attempt == 0 and "ERR_ABORTED" in str(exc):
-                    log.debug("goto aborted (SPA still navigating), retrying in 2 s…")
                     time.sleep(2)
                 else:
                     raise
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
         except PlaywrightTimeout:
-            pass  # SPA — networkidle may never fire; the page is usable anyway
+            pass
 
 
 def navigate_to_bookings(page) -> None:
-    """Ensure we are on the booking calendar page."""
     if ORG_URL not in page.url:
         log.info("Navigating to booking calendar: %s", ORG_URL)
         page.goto(ORG_URL, wait_until="networkidle")
 
 
 def select_sport(page) -> bool:
-    """If there is a sport/court-type filter, select 'badminton'."""
-    selectors = [
-        'select[id*="sport" i]',
-        'select[name*="sport" i]',
-        'select[id*="court" i]',
-        'select[name*="courtType" i]',
-    ]
-    for sel in selectors:
+    for sel in ('select[id*="sport" i]', 'select[name*="sport" i]',
+                'select[id*="court" i]', 'select[name*="courtType" i]'):
         try:
             el = page.locator(sel).first
             if el.count() > 0 and el.is_visible(timeout=2_000):
@@ -249,44 +353,29 @@ def select_sport(page) -> bool:
 
 
 def _get_calendar_frame(page):
-    """
-    Detect which frame (iframe or main page) contains the booking calendar.
-    Returns the matching Frame, or the main page if no iframe matches.
-    """
     try:
         page.wait_for_selector("iframe", timeout=10_000)
     except PlaywrightTimeout:
         pass
-
     all_frames = page.frames
-    iframe_count = len(all_frames) - 1
-    log.info("Found %d iframe(s) on the page.", iframe_count)
-    for idx, frm in enumerate(all_frames[1:], start=1):
-        log.debug("  iframe[%d] url=%s", idx, frm.url)
-
+    log.info("Found %d iframe(s) on the page.", len(all_frames) - 1)
     for idx, frm in enumerate(all_frames[1:], start=1):
         try:
-            frm.wait_for_selector(
-                "text=/Reserve|NONE AVAILABLE/i",
-                timeout=8_000,
-            )
+            frm.wait_for_selector("text=/Reserve|NONE AVAILABLE/i", timeout=8_000)
             log.info("Calendar grid detected in iframe[%d].", idx)
             return frm
         except PlaywrightTimeout:
             continue
-
     log.info("No calendar iframe matched; using main page frame.")
     return page
 
 
 def _wait_for_calendar(ctx) -> None:
-    """Block until the calendar grid has rendered at least one slot cell."""
     try:
         ctx.wait_for_selector("text=/Reserve|NONE AVAILABLE/i", timeout=15_000)
         return
     except PlaywrightTimeout:
         pass
-
     for sel in (".fc-widget-content", ".fc-time-grid td", ".fc-day-grid td",
                 "[class*='fc-slot']", "td.fc-agenda-slots"):
         try:
@@ -294,7 +383,6 @@ def _wait_for_calendar(ctx) -> None:
             return
         except PlaywrightTimeout:
             continue
-
     log.debug("_wait_for_calendar: calendar may not have fully rendered")
 
 
@@ -308,84 +396,60 @@ _NEXT_BTN_SELECTORS = [
 
 
 def _navigate_to_date(page, cal_frame, day_offset: int) -> None:
-    """Advance the CourtReserve calendar to the correct date."""
     if day_offset == 0:
         return
-
     clicked = False
-    for search_ctx in (cal_frame, page):
+    for ctx in (cal_frame, page):
         for sel in _NEXT_BTN_SELECTORS:
             try:
-                btn = search_ctx.locator(sel).first
+                btn = ctx.locator(sel).first
                 if btn.is_visible(timeout=2_000):
                     btn.click()
                     clicked = True
                     break
-            except PlaywrightTimeout:
-                continue
             except Exception:
                 continue
         if clicked:
             break
-
     if not clicked:
-        log.warning(
-            "Could not find next-day arrow (offset %d); calendar may not advance.",
-            day_offset,
-        )
-
+        log.warning("Could not find next-day arrow (offset %d).", day_offset)
     _wait_for_calendar(cal_frame)
 
+# ---------------------------------------------------------------------------
+# Slot time extraction
+# ---------------------------------------------------------------------------
 
 def _parse_slot_time(text: str) -> tuple[int, int] | None:
-    """
-    Parse (hour_24, minute) from a slot label like '8:00 AM', '5:30 PM', '17:30'.
-    Returns None if parsing fails.
-    """
-    import re
-
     m = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", text, re.IGNORECASE)
     if not m:
         return None
-
-    hour     = int(m.group(1))
-    minute   = int(m.group(2))
+    hour, minute = int(m.group(1)), int(m.group(2))
     meridiem = (m.group(3) or "").upper()
-
     if meridiem == "PM" and hour != 12:
         hour += 12
     elif meridiem == "AM" and hour == 12:
         hour = 0
-
     return (hour, minute)
 
 
 def _get_slot_time(slot_element) -> tuple[int, int] | None:
-    """
-    Extract the (hour, minute) for a slot by inspecting its DOM context.
-
-    Tries, in order:
-    1. data-time / data-start attribute on the element or its ancestors
-    2. The first cell of the enclosing <tr> (the row time-label)
-    3. Any ancestor element whose text contains a time pattern
-    """
     try:
-        time_text = slot_element.evaluate(
+        val = slot_element.evaluate(
             """el => {
-                for (const attr of ['data-time', 'data-start', 'data-slot-time',
-                                    'data-begin', 'data-starttime']) {
+                for (const attr of ['data-time','data-start','data-slot-time',
+                                    'data-begin','data-starttime']) {
                     let node = el;
                     while (node) {
-                        const val = node.getAttribute && node.getAttribute(attr);
-                        if (val) return val;
+                        const v = node.getAttribute && node.getAttribute(attr);
+                        if (v) return v;
                         node = node.parentElement;
                     }
                 }
                 return null;
             }"""
         )
-        if time_text:
-            t = _parse_slot_time(time_text)
+        if val:
+            t = _parse_slot_time(val)
             if t is not None:
                 return t
 
@@ -393,10 +457,10 @@ def _get_slot_time(slot_element) -> tuple[int, int] | None:
             """el => {
                 const row = el.closest('tr') || el.closest('[role="row"]');
                 if (!row) return null;
-                const firstCell = row.querySelector(
+                const cell = row.querySelector(
                     'td:first-child, th:first-child, [role="rowheader"]'
                 );
-                return firstCell ? firstCell.innerText.trim() : null;
+                return cell ? cell.innerText.trim() : null;
             }"""
         )
         if row_label:
@@ -404,7 +468,7 @@ def _get_slot_time(slot_element) -> tuple[int, int] | None:
             if t is not None:
                 return t
 
-        ancestor_text = slot_element.evaluate(
+        anc = slot_element.evaluate(
             r"""el => {
                 let node = el.parentElement;
                 for (let i = 0; i < 6; i++) {
@@ -416,83 +480,37 @@ def _get_slot_time(slot_element) -> tuple[int, int] | None:
                 return null;
             }"""
         )
-        if ancestor_text:
-            return _parse_slot_time(ancestor_text)
-
+        if anc:
+            return _parse_slot_time(anc)
     except Exception as exc:
         log.debug("_get_slot_time error: %s", exc)
-
     return None
 
+# ---------------------------------------------------------------------------
+# Slot scanning
+# ---------------------------------------------------------------------------
 
 def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
-    """
-    Find all available (Reserve) slots on the current calendar day whose
-    start time falls between 6:00 PM and 9:30 PM.
-
-    Returns a list of formatted strings like "6:00 PM – 7:00 PM".
-    No clicking or booking is performed.
-    """
-    log.info("Waiting 4 s for page to fully settle before scanning…")
+    """Return deduplicated, filtered slot strings for target_date."""
+    log.info("Waiting 4 s for page to settle…")
     time.sleep(4)
 
-    # ── Diagnostic dump ──────────────────────────────────────────────────────
+    # Diagnostic ──────────────────────────────────────────────────────────────
     try:
         body_text = cal_frame.inner_text("body")
         has_reserve = "reserve" in body_text.lower()
         log.info("Diagnostic: 'reserve' in page text = %s", has_reserve)
         if has_reserve:
-            idx = body_text.lower().index("reserve")
-            start = max(0, idx - 120)
-            end   = min(len(body_text), idx + 180)
-            log.info("Diagnostic: context around first 'reserve': …%s…",
+            idx   = body_text.lower().index("reserve")
+            start = max(0, idx - 100)
+            end   = min(len(body_text), idx + 160)
+            log.info("Diagnostic context: …%s…",
                      body_text[start:end].replace("\n", " | "))
         else:
-            snippet = body_text[:2_000].replace("\n", " | ")
-            log.info("Diagnostic: page inner_text (first 2000 chars): %s", snippet)
+            log.info("Diagnostic: page text (first 1500): %s",
+                     body_text[:1_500].replace("\n", " | "))
     except Exception as exc:
-        log.debug("Diagnostic inner_text dump failed: %s", exc)
-
-    try:
-        html = page.content()
-        has_reserve_html = "reserve" in html.lower()
-        log.info("Diagnostic: 'reserve' in page HTML  = %s", has_reserve_html)
-        if not has_reserve_html:
-            log.info("Diagnostic: page HTML snippet (first 3000 chars): %s", html[:3_000])
-    except Exception as exc:
-        log.debug("Diagnostic HTML dump failed: %s", exc)
-
-    try:
-        reserve_nodes = cal_frame.evaluate(
-            """() => {
-                const out = [];
-                const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT
-                );
-                let node;
-                while ((node = walker.nextNode()) && out.length < 3) {
-                    if (node.textContent.trim().toLowerCase() === 'reserve') {
-                        const el = node.parentElement;
-                        out.push({
-                            tag:        el ? el.tagName : 'N/A',
-                            className:  el ? el.className : '',
-                            outerHTML:  el ? el.outerHTML.substring(0, 400) : '',
-                            parentTag:  el && el.parentElement ? el.parentElement.tagName : '',
-                            parentHTML: el && el.parentElement
-                                            ? el.parentElement.outerHTML.substring(0, 600) : '',
-                        });
-                    }
-                }
-                return out;
-            }"""
-        )
-        for i, n in enumerate(reserve_nodes or []):
-            log.info("Diagnostic: Reserve node[%d] tag=<%s> class=%r outerHTML=%s",
-                     i, n["tag"], n["className"], n["outerHTML"])
-            log.info("Diagnostic: Reserve node[%d] parent=<%s> parentHTML=%s",
-                     i, n["parentTag"], n["parentHTML"])
-    except Exception as exc:
-        log.debug("Diagnostic Reserve DOM dump failed: %s", exc)
+        log.debug("Diagnostic failed: %s", exc)
     # ─────────────────────────────────────────────────────────────────────────
 
     available_slots = cal_frame.get_by_text("Reserve", exact=True)
@@ -503,183 +521,273 @@ def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
 
     seen_times: set[tuple[int, int]] = set()
     found: list[str] = []
+
     for i in range(count):
         slot = available_slots.nth(i)
         try:
             slot_time = _get_slot_time(slot)
             if slot_time is None:
-                log.debug("Slot %d: could not determine time, skipping.", i)
                 continue
 
             h, m = slot_time
             if not (_WINDOW_START_MINS <= h * 60 + m <= _WINDOW_END_MINS):
-                log.debug(
-                    "Slot %d at %02d:%02d is outside 6–9:30 PM window, skipping.",
-                    i, h, m,
-                )
                 continue
 
-            # Filter by data-courttype="Badminton" on the container div.
-            # The CourtReserve DOM structure is:
-            #   <div data-courttype="Badminton" data-time="6:00 PM">
-            #     <a class="btn slot-btn ...">Reserve</a>
-            #   </div>
-            # Compact courts have data-courttype="Badminton (Compact - 20% Off)".
+            # Exact courttype match via data-courttype on the container div
             is_badminton = slot.evaluate(
                 """el => {
                     const c = el.closest('[data-courttype]');
-                    if (!c) return true;  // can't determine — allow it
+                    if (!c) return true;
                     return c.getAttribute('data-courttype') === 'Badminton';
                 }"""
             )
             if not is_badminton:
-                log.debug("Slot %d: courttype is not 'Badminton', skipping.", i)
                 continue
 
-            # Deduplicate by start time — multiple physical courts can be
-            # open at the same time; report each time slot only once.
+            # Deduplicate by start time (multiple courts at same time)
             if (h, m) in seen_times:
-                log.debug("Slot %d at %02d:%02d already listed, skipping.", i, h, m)
                 continue
             seen_times.add((h, m))
 
             found.append(_format_slot(h, m))
         except Exception as exc:
-            log.debug("Error processing slot %d: %s", i, exc)
+            log.debug("Slot %d error: %s", i, exc)
 
-    log.info(
-        "Found %d evening slot(s) on %s.", len(found), target_date.strftime("%Y-%m-%d")
-    )
+    log.info("Found %d evening Badminton slot(s) on %s.",
+             len(found), target_date.strftime("%Y-%m-%d"))
     return found
 
 
 def find_available_slots(page) -> dict:
-    """
-    Scan the calendar across the next DAYS_AHEAD days for available evening
-    badminton slots (6:00 PM – 9:30 PM start times).
-
-    Returns a dict mapping date labels to lists of formatted slot strings:
-        {"Thursday Feb 26": ["6:00 PM – 7:00 PM", "7:30 PM – 8:30 PM"], ...}
-    An empty dict means no slots were found across all scanned days.
-    """
-    today = datetime.today().date()
+    """Scan all DAYS_AHEAD days. Returns {date_label: [slot_strs]}."""
+    today     = datetime.today().date()
     cal_frame = _get_calendar_frame(page)
-    results = {}
+    results   = {}
 
     for day_offset in range(DAYS_AHEAD):
         target_date = today + timedelta(days=day_offset)
-        log.info("Checking availability for %s…", target_date.strftime("%A %Y-%m-%d"))
-
+        log.info("Checking %s…", target_date.strftime("%A %Y-%m-%d"))
         _navigate_to_date(page, cal_frame, day_offset)
         slots = _collect_slots_on_page(page, cal_frame, target_date)
-
         if slots:
-            # Cross-platform label without leading zero: "Thursday Feb 26"
             date_label = target_date.strftime("%A %b ") + str(target_date.day)
             results[date_label] = slots
 
     return results
 
-
 # ---------------------------------------------------------------------------
-# Main loop
+# Slot booking
 # ---------------------------------------------------------------------------
 
-def run_once() -> bool:
+def _confirm_booking(page) -> bool:
+    """Click the confirm/book button and verify a success indicator."""
+    for sel in ('button:has-text("Confirm")', 'button:has-text("Book")',
+                'button:has-text("Reserve Now")', 'input[value="Confirm"]',
+                '#confirmReservation', '.btn-confirm'):
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible(timeout=3_000):
+                btn.click()
+                page.wait_for_load_state("networkidle")
+                if any(kw in page.content().lower()
+                       for kw in ("confirmed", "success", "booked", "reservation")):
+                    return True
+        except Exception:
+            pass
+    try:
+        page.wait_for_selector('text=/confirmed|success|booked/i', timeout=5_000)
+        return True
+    except PlaywrightTimeout:
+        pass
+    return False
+
+
+def _book_specific_slot(date_str: str, time_24: str) -> bool:
     """
-    Run a single scan cycle.
-    Sends a Telegram message if evening slots are found.
-    Returns True if any slots were found and notified.
+    Open a new Playwright session and book the Badminton slot at
+    date_str (YYYY-MM-DD) and time_24 (HH:MM, 24-hour).
     """
+    from datetime import date as _date
+    target     = _date.fromisoformat(date_str)
+    day_offset = (target - datetime.today().date()).days
+
+    if day_offset < 0:
+        log.warning("Cannot book past date %s", date_str)
+        return False
+
+    h, m         = map(int, time_24.split(":"))
+    data_time    = _time_to_data_time(h, m)   # e.g. "6:00 PM"
+    slot_selector = (
+        f'[data-testid="reserveBtn"][data-courttype="Badminton"]'
+        f'[data-time="{data_time}"] a.slot-btn'
+    )
+    log.info("Booking slot: %s at %s (data-time=%s)", date_str, time_24, data_time)
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--window-size=1280,900",
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
-
-        ctx_kwargs = dict(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        if os.path.exists(COOKIES_FILE):
-            ctx_kwargs["storage_state"] = COOKIES_FILE
-            log.info("Loaded saved session from %s", COOKIES_FILE)
-
-        context = browser.new_context(**ctx_kwargs)
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page = context.new_page()
-
+        browser, context, page = _new_browser_context(pw)
         try:
             login(page)
             page.context.storage_state(path=COOKIES_FILE)
-            log.info("Saved session cookies to %s", COOKIES_FILE)
-
             navigate_to_bookings(page)
             select_sport(page)
-            results = find_available_slots(page)
 
-            if results:
-                # Send one short message per day to stay under Telegram's
-                # 4096-character limit and keep notifications readable.
-                for date_label, slots in results.items():
-                    message = (
-                        f"📅 {date_label} — Available Badminton slots:\n"
-                        + "\n".join(slots)
-                    )
-                    log.info("Sending Telegram notification:\n%s", message)
-                    _send_telegram(message)
-                return True
+            cal_frame = _get_calendar_frame(page)
+            _navigate_to_date(page, cal_frame, day_offset)
+            _wait_for_calendar(cal_frame)
+            time.sleep(2)
 
-            return False
+            slot = cal_frame.locator(slot_selector).first
+            if not slot.is_visible(timeout=8_000):
+                log.warning("Slot %s on %s not visible — may already be taken.",
+                            data_time, date_str)
+                return False
 
-        except PlaywrightTimeout as exc:
-            log.error("Timed out during automation: %s", exc)
+            slot.click()
+            page.wait_for_load_state("networkidle")
+
+            confirmed = _confirm_booking(page)
+            if confirmed:
+                log.info("SUCCESS: Booked Badminton on %s at %s", date_str, time_24)
+            else:
+                log.warning("Booking click succeeded but confirmation unclear.")
+            return confirmed
+
         except Exception as exc:
-            log.exception("Unexpected error: %s", exc)
+            log.exception("Error during booking: %s", exc)
+            return False
         finally:
             context.close()
             browser.close()
 
-    return False
 
+def _book_and_notify(date_str: str, time_24: str, chat_id: str | int) -> None:
+    """Book the slot (in its own thread) and send the result to the user."""
+    success = _book_specific_slot(date_str, time_24)
+    _reset_conversation()   # fresh conversation after booking is done
 
-def main() -> None:
-    _validate_config()
+    h, m = map(int, time_24.split(":"))
+    slot_label = _format_slot(h, m)
+    if success:
+        msg = f"✅ Booked! {slot_label} on {date_str}. Check your email for the PIN code."
+    else:
+        msg = (
+            f"❌ Booking failed for {slot_label} on {date_str}. "
+            "The slot may have just been taken. Please try booking manually."
+        )
+    _tg_send(chat_id, msg)
 
-    log.info("=== Kotofit Badminton Slot Notifier ===")
-    log.info("Location : Kotofit Jersey City – Brunswick St")
-    log.info("Sport    : %s", SPORT_TYPE)
-    log.info("Window   : 6:00 PM – 9:30 PM start (1-hour slots)")
-    log.info("Interval : every %d minutes", CHECK_INTERVAL // 60)
-    log.info("Headless : %s", HEADLESS)
-    log.info("")
+# ---------------------------------------------------------------------------
+# Scan session
+# ---------------------------------------------------------------------------
+
+def _run_scan_once() -> dict:
+    """Run one Playwright session; return {date_label: [slot_strs]}."""
+    with sync_playwright() as pw:
+        browser, context, page = _new_browser_context(pw)
+        try:
+            login(page)
+            page.context.storage_state(path=COOKIES_FILE)
+            log.info("Saved session cookies to %s", COOKIES_FILE)
+            navigate_to_bookings(page)
+            select_sport(page)
+            return find_available_slots(page)
+        except PlaywrightTimeout as exc:
+            log.error("Timeout during scan: %s", exc)
+        except Exception as exc:
+            log.exception("Scan error: %s", exc)
+        finally:
+            context.close()
+            browser.close()
+    return {}
+
+# ---------------------------------------------------------------------------
+# Slot notification via Claude
+# ---------------------------------------------------------------------------
+
+def _notify_slots_found(results: dict) -> None:
+    """
+    Send found slots to Claude; Claude crafts a friendly Telegram message
+    which is forwarded to the user.
+    """
+    lines = ["Available Badminton courts just opened up at Kotofit Jersey City:"]
+    for date_label, slots in results.items():
+        lines.append(f"\n{date_label}:")
+        for slot in slots:
+            lines.append(f"  • {slot}")
+    lines.append(
+        "\nPlease let the user know about these slots in a friendly way "
+        "and ask which one they'd like to book."
+    )
+    prompt = "\n".join(lines)
+
+    log.info("Sending slot summary to Claude…")
+    try:
+        reply = _call_claude(prompt)
+        log.info("Claude formatted notification, sending to Telegram…")
+        _tg_send(TELEGRAM_CHAT_ID, reply)
+    except Exception as exc:
+        log.error("Failed to notify via Claude: %s", exc)
+
+# ---------------------------------------------------------------------------
+# Scan thread
+# ---------------------------------------------------------------------------
+
+def _scan_loop() -> None:
+    log.info("Scan thread started — waiting for Telegram bot to be ready…")
+    _bot_ready.wait()   # do not scan until the bot's event loop is running
 
     attempt = 0
     while True:
         attempt += 1
-        log.info("--- Check #%d at %s ---", attempt, datetime.now().strftime("%H:%M:%S"))
+        log.info("--- Scan #%d at %s ---", attempt, datetime.now().strftime("%H:%M:%S"))
+        try:
+            results = _run_scan_once()
+            if results:
+                _notify_slots_found(results)
+            else:
+                log.info("No evening Badminton slots found.")
+        except Exception as exc:
+            log.exception("Unhandled error in scan loop: %s", exc)
 
-        found = run_once()
-
-        if found:
-            log.info("Telegram notification sent for available slots.")
-        else:
-            log.info("No available evening slots found.")
-
-        log.info("Next check in %d minutes.", CHECK_INTERVAL // 60)
+        log.info("Next scan in %d minutes.", CHECK_INTERVAL // 60)
         time.sleep(CHECK_INTERVAL)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    global _anthropic_client, _bot_app
+
+    _validate_config()
+
+    _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    log.info("=== Kotofit Badminton Booking Assistant ===")
+    log.info("Location : Kotofit Jersey City – Brunswick St")
+    log.info("Window   : 6:00 PM – 9:30 PM (1-hour slots, Badminton only)")
+    log.info("Interval : every %d minutes", CHECK_INTERVAL // 60)
+    log.info("Model    : claude-sonnet-4-20250514")
+    log.info("Headless : %s", HEADLESS)
+    log.info("")
+
+    # Start scan thread (daemon so it dies with the main thread)
+    scan_thread = threading.Thread(target=_scan_loop, daemon=True, name="scanner")
+    scan_thread.start()
+
+    # Build the Telegram Application and register handlers
+    _bot_app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)        # sets _bot_loop and signals _bot_ready
+        .build()
+    )
+    _bot_app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
+    )
+
+    log.info("Starting Telegram bot polling…")
+    _bot_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
