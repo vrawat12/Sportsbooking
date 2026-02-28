@@ -509,6 +509,38 @@ def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
                 )
                 continue
 
+            # Only include slots under an exact "Badminton" column header.
+            # Rejects "Badminton (Compact - 20% Off)" and other court types.
+            in_badminton_col = slot.evaluate(
+                """el => {
+                    const cell = el.closest('td') || el.closest('[role="gridcell"]');
+                    if (!cell) return true;  // can't determine — allow it
+
+                    const row = cell.closest('tr') || cell.closest('[role="row"]');
+                    if (!row) return true;
+
+                    const colIndex = Array.from(row.children).indexOf(cell);
+
+                    const table = row.closest('table') || row.closest('[role="grid"]');
+                    if (!table) return true;
+
+                    const headers = table.querySelectorAll(
+                        'thead th, thead td, [role="columnheader"]'
+                    );
+                    if (!headers.length) return true;
+
+                    const header = headers[colIndex];
+                    if (!header) return true;
+
+                    const text = header.innerText.trim().toLowerCase();
+                    // Must contain "badminton" but NOT "compact"
+                    return text.includes('badminton') && !text.includes('compact');
+                }"""
+            )
+            if not in_badminton_col:
+                log.debug("Slot %d: not a standard Badminton column, skipping.", i)
+                continue
+
             found.append(_format_slot(h, m))
         except Exception as exc:
             log.debug("Error processing slot %d: %s", i, exc)
@@ -597,14 +629,15 @@ def run_once() -> bool:
             results = find_available_slots(page)
 
             if results:
-                lines = []
+                # Send one short message per day to stay under Telegram's
+                # 4096-character limit and keep notifications readable.
                 for date_label, slots in results.items():
-                    lines.append(f"Available badminton slots for {date_label}:")
-                    for j, slot_str in enumerate(slots, 1):
-                        lines.append(f"  {j}. {slot_str}")
-                message = "\n".join(lines)
-                log.info("Sending Telegram notification:\n%s", message)
-                _send_telegram(message)
+                    message = (
+                        f"📅 {date_label} — Available Badminton slots:\n"
+                        + "\n".join(slots)
+                    )
+                    log.info("Sending Telegram notification:\n%s", message)
+                    _send_telegram(message)
                 return True
 
             return False
