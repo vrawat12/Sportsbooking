@@ -23,6 +23,7 @@ import json
 import random
 import logging
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -98,18 +99,26 @@ def _human_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
 def _send_telegram(text: str) -> None:
     """Send a plain-text message via the Telegram Bot API."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    # ensure_ascii=False encodes emoji as UTF-8 bytes rather than broken
+    # surrogate-pair escape sequences (\ud83d\udcc5) that cause HTTP 400.
+    payload = json.dumps(
+        {"chat_id": TELEGRAM_CHAT_ID, "text": text}, ensure_ascii=False
+    ).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
+    log.info("Calling Telegram API (chat_id=%s, %d chars)", TELEGRAM_CHAT_ID, len(text))
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 200:
                 log.info("Telegram notification sent.")
             else:
                 log.warning("Telegram API returned status %d", resp.status)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        log.warning("Telegram HTTP %d error: %s", exc.code, body[:500])
     except Exception as exc:
         log.warning("Failed to send Telegram notification: %s", exc)
 
@@ -492,7 +501,8 @@ def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
     if count == 0:
         return []
 
-    found = []
+    seen_times: set[tuple[int, int]] = set()
+    found: list[str] = []
     for i in range(count):
         slot = available_slots.nth(i)
         try:
@@ -509,37 +519,29 @@ def _collect_slots_on_page(page, cal_frame, target_date) -> list[str]:
                 )
                 continue
 
-            # Only include slots under an exact "Badminton" column header.
-            # Rejects "Badminton (Compact - 20% Off)" and other court types.
-            in_badminton_col = slot.evaluate(
+            # Filter by data-courttype="Badminton" on the container div.
+            # The CourtReserve DOM structure is:
+            #   <div data-courttype="Badminton" data-time="6:00 PM">
+            #     <a class="btn slot-btn ...">Reserve</a>
+            #   </div>
+            # Compact courts have data-courttype="Badminton (Compact - 20% Off)".
+            is_badminton = slot.evaluate(
                 """el => {
-                    const cell = el.closest('td') || el.closest('[role="gridcell"]');
-                    if (!cell) return true;  // can't determine — allow it
-
-                    const row = cell.closest('tr') || cell.closest('[role="row"]');
-                    if (!row) return true;
-
-                    const colIndex = Array.from(row.children).indexOf(cell);
-
-                    const table = row.closest('table') || row.closest('[role="grid"]');
-                    if (!table) return true;
-
-                    const headers = table.querySelectorAll(
-                        'thead th, thead td, [role="columnheader"]'
-                    );
-                    if (!headers.length) return true;
-
-                    const header = headers[colIndex];
-                    if (!header) return true;
-
-                    const text = header.innerText.trim().toLowerCase();
-                    // Must contain "badminton" but NOT "compact"
-                    return text.includes('badminton') && !text.includes('compact');
+                    const c = el.closest('[data-courttype]');
+                    if (!c) return true;  // can't determine — allow it
+                    return c.getAttribute('data-courttype') === 'Badminton';
                 }"""
             )
-            if not in_badminton_col:
-                log.debug("Slot %d: not a standard Badminton column, skipping.", i)
+            if not is_badminton:
+                log.debug("Slot %d: courttype is not 'Badminton', skipping.", i)
                 continue
+
+            # Deduplicate by start time — multiple physical courts can be
+            # open at the same time; report each time slot only once.
+            if (h, m) in seen_times:
+                log.debug("Slot %d at %02d:%02d already listed, skipping.", i, h, m)
+                continue
+            seen_times.add((h, m))
 
             found.append(_format_slot(h, m))
         except Exception as exc:
